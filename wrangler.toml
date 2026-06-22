@@ -1,0 +1,49 @@
+# =============================================================
+# Suri — Cloudflare Worker config
+# =============================================================
+
+name       = "suri-worker"
+main       = "suri-worker.js"
+compatibility_date = "2025-04-01"
+
+# Cloudflare Queue for async Claude processing
+[[queues.producers]]
+queue      = "suri-processing-queue"
+binding    = "SURI_QUEUE"
+
+# Environment variables (secrets set via `wrangler secret put`)
+# Do NOT put real values here — use `wrangler secret put VAR_NAME`
+[vars]
+ENVIRONMENT = "production"
+
+# Secrets (set with: wrangler secret put SECRET_NAME)
+# SUPABASE_URL
+# SUPABASE_SERVICE_KEY
+# AZURE_TENANT_ID
+# AZURE_CLIENT_ID
+# AZURE_CLIENT_SECRET
+# SURI_MAILBOX              (e.g. claims@smartsure.co.za)
+# M365_WEBHOOK_SECRET       (random string, set in M365 subscription + here)
+# PORTAL_API_KEY            (random string, used by Cloudflare Pages frontend)
+
+# Routes — update to your actual domain
+[[routes]]
+pattern    = "claims.novachrono.app/*"
+zone_name  = "novachrono.app"
+
+# =============================================================
+# Processor worker (separate worker, same queue as consumer)
+# =============================================================
+
+# Add this section to your existing wrangler.toml or use a
+# second wrangler config file: wrangler.processor.toml
+
+# [[queues.consumers]]
+# queue           = "suri-processing-queue"
+# binding         = "SURI_QUEUE"
+# max_batch_size  = 5      # process up to 5 claims at once
+# max_retries     = 3      # retry failed messages 3 times
+# dead_letter_queue = "suri-dead-letter-queue"
+
+# Secrets needed by the processor (in addition to Worker secrets):
+# ANTHROPIC_API_KEY
