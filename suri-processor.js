@@ -619,19 +619,25 @@ function determineHandlerRouting(band, classification) {
 // BROKER EMAIL BUILDER (unchanged from v1)
 // =============================================================
 
-function buildBrokerEmail(claim, aiOutput, completenessResult, rulesResult) {
-  const insuredName = aiOutput.extracted_fields?.insured_name || 'the insured';
-  const policyNo    = aiOutput.extracted_fields?.policy_number || 'not yet confirmed';
-  const claimRef    = claim.claim_ref;
-  const peril       = aiOutput.classification?.peril_type || 'not yet classified';
+// All submitter/AI-derived values are HTML-escaped before interpolation —
+// extracted document text and form input must never inject markup into
+// stored email HTML (or into any future dashboard preview of it).
+// Exported for tests.
+export function buildBrokerEmail(claim, aiOutput, completenessResult, rulesResult) {
+  const insuredName = escapeHtml(aiOutput.extracted_fields?.insured_name || 'the insured');
+  const policyNo    = escapeHtml(aiOutput.extracted_fields?.policy_number || 'not yet confirmed');
+  const claimRef    = escapeHtml(claim.claim_ref);
+  const brokerName  = escapeHtml(claim.broker_name || 'Broker');
+  const peril       = escapeHtml(capitalise(aiOutput.classification?.peril_type || 'not yet classified'));
   const outstanding = completenessResult.outstanding || [];
 
-  const subject = `Claim received — ${claimRef} — ${insuredName}`;
+  // Subject is plain text (not HTML) — raw values are correct here.
+  const subject = `Claim received — ${claim.claim_ref} — ${aiOutput.extracted_fields?.insured_name || 'the insured'}`;
 
   const outstandingSection = outstanding.length > 0
     ? `<h3 style="color:#c0392b;">Outstanding documents required</h3>
        <p>To complete registration, please supply the following:</p>
-       <ul>${outstanding.map(doc => `<li>${formatDocumentName(doc)}</li>`).join('')}</ul>
+       <ul>${outstanding.map(doc => `<li>${escapeHtml(formatDocumentName(doc))}</li>`).join('')}</ul>
        <p>Please reply to this email with the documents attached, quoting <strong>${claimRef}</strong>.</p>`
     : `<p>All required documents have been received.</p>`;
 
@@ -639,13 +645,13 @@ function buildBrokerEmail(claim, aiOutput, completenessResult, rulesResult) {
 <!DOCTYPE html>
 <html><head><meta charset="UTF-8"></head>
 <body style="font-family: Arial, sans-serif; font-size: 14px; color: #333; max-width: 600px;">
-<p>Dear ${claim.broker_name || 'Broker'},</p>
+<p>Dear ${brokerName},</p>
 <p>Thank you for submitting a claim on behalf of <strong>${insuredName}</strong>. We confirm receipt and have registered the claim:</p>
 <table style="border-collapse: collapse; width: 100%; margin-bottom: 16px;">
   <tr><td style="padding:6px 12px;background:#f5f5f5;font-weight:bold;width:40%;">Claim reference</td><td style="padding:6px 12px;">${claimRef}</td></tr>
   <tr><td style="padding:6px 12px;background:#f5f5f5;font-weight:bold;">Insured</td><td style="padding:6px 12px;">${insuredName}</td></tr>
   <tr><td style="padding:6px 12px;background:#f5f5f5;font-weight:bold;">Policy number</td><td style="padding:6px 12px;">${policyNo}</td></tr>
-  <tr><td style="padding:6px 12px;background:#f5f5f5;font-weight:bold;">Peril</td><td style="padding:6px 12px;">${capitalise(peril)}</td></tr>
+  <tr><td style="padding:6px 12px;background:#f5f5f5;font-weight:bold;">Peril</td><td style="padding:6px 12px;">${peril}</td></tr>
   <tr><td style="padding:6px 12px;background:#f5f5f5;font-weight:bold;">Date received</td><td style="padding:6px 12px;">${new Date().toLocaleDateString('en-ZA', { day:'numeric', month:'long', year:'numeric' })}</td></tr>
 </table>
 ${outstandingSection}
@@ -862,6 +868,15 @@ function uint8ArrayToBase64(bytes) {
 function capitalise(s) {
   if (!s) return '';
   return s.replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase());
+}
+
+function escapeHtml(value) {
+  return String(value ?? '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
 }
 
 function formatDocumentName(docType) {

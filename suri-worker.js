@@ -23,8 +23,11 @@ const ALLOWED_MIME_TYPES = new Set([
 const MAX_FILE_SIZE_BYTES  = 20 * 1024 * 1024;
 const MAX_TOTAL_SIZE_BYTES = 80 * 1024 * 1024;
 
-// CORS — tighten to portal domain in production
-const PORTAL_ORIGINS = ['*']; // e.g. ['https://claims.smartsure.co.za']
+// CORS allowlist comes from the PORTAL_ORIGINS env var (comma-separated
+// browser origins, e.g. "https://claims.smartsure.co.za"). No wildcard:
+// requests from origins not in the list get no Access-Control-Allow-Origin
+// header. Requests without an Origin header (curl, server-to-server,
+// Graph webhooks) are unaffected — CORS only gates browsers.
 
 // =============================================================
 // MAIN ROUTER
@@ -34,7 +37,7 @@ export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
 
-    if (request.method === 'OPTIONS') return corsResponse(null, 204, request);
+    if (request.method === 'OPTIONS') return corsResponse(null, 204, request, env);
 
     try {
       if (url.pathname === '/webhooks/email' && request.method === 'POST') {
@@ -63,21 +66,25 @@ export default {
 // =============================================================
 
 async function handleWebPortalUpload(request, env, ctx) {
+  // Rate limit FIRST — before body parsing, Turnstile, Supabase or queue work.
+  const rateLimited = await checkUploadRateLimit(request, env);
+  if (rateLimited) return rateLimited;
+
   let formData;
   try {
     formData = await request.formData();
   } catch {
-    return corsResponse({ error: 'Invalid multipart form data' }, 400, request);
+    return corsResponse({ error: 'Invalid multipart form data' }, 400, request, env);
   }
 
   // 1. Validate Turnstile token (replaces old x-suri-portal-key header)
   const turnstileToken = formData.get('cf-turnstile-response');
   if (!turnstileToken) {
-    return corsResponse({ error: 'Captcha verification required' }, 401, request);
+    return corsResponse({ error: 'Captcha verification required' }, 401, request, env);
   }
   const captchaValid = await validateTurnstile(turnstileToken, request, env);
   if (!captchaValid) {
-    return corsResponse({ error: 'Captcha verification failed' }, 401, request);
+    return corsResponse({ error: 'Captcha verification failed' }, 401, request, env);
   }
 
   // 2. Build submission payload from all form fields (preserves what broker typed)
@@ -116,17 +123,17 @@ async function handleWebPortalUpload(request, env, ctx) {
 
   const validationErrors = validatePortalSubmission(data);
   if (validationErrors.length) {
-    return corsResponse({ error: 'Validation failed', details: validationErrors }, 422, request);
+    return corsResponse({ error: 'Validation failed', details: validationErrors }, 422, request, env);
   }
 
   // 4. File validation
   const files = formData.getAll('documents');
   if (!files.length) {
-    return corsResponse({ error: 'At least one document is required' }, 422, request);
+    return corsResponse({ error: 'At least one document is required' }, 422, request, env);
   }
   const fileErrors = await validateFiles(files);
   if (fileErrors.length) {
-    return corsResponse({ error: 'File validation failed', details: fileErrors }, 422, request);
+    return corsResponse({ error: 'File validation failed', details: fileErrors }, 422, request, env);
   }
 
   // 5. BANKING BOUNDARY — scrub everything the submitter typed before it is
@@ -141,9 +148,12 @@ async function handleWebPortalUpload(request, env, ctx) {
     locations:       [...payloadScrub.locations, ...dataScrub.locations],
   };
 
+  // POPIA: log access origin on portal-originated audit rows (see PRIVACY.md).
+  const clientIp = request.headers.get('cf-connecting-ip') || null;
+
   // 6. Create claim + upload docs + queue processing
   const { claimId, claimRef } = await createClaimFromPortal(
-    dataScrub.sanitised, payloadScrub.sanitised, files, env, bankingScrub
+    dataScrub.sanitised, payloadScrub.sanitised, files, env, bankingScrub, clientIp
   );
 
   ctx.waitUntil(
@@ -154,7 +164,36 @@ async function handleWebPortalUpload(request, env, ctx) {
     status: 'received',
     claim_ref: claimRef,
     message: 'Your claim has been received. You will receive a confirmation email shortly.',
-  }, 202, request);
+  }, 202, request, env);
+}
+
+// =============================================================
+// UPLOAD RATE LIMITING
+// Uses the Workers Rate Limiting binding (see [[ratelimits]] in
+// wrangler.toml), keyed by client IP. FAIL-OPEN by design: if the
+// binding is missing or errors, the request proceeds (Turnstile still
+// gates it) so config drift can never block legitimate submissions.
+// =============================================================
+
+async function checkUploadRateLimit(request, env) {
+  const limiter = env?.UPLOAD_RATE_LIMITER;
+  if (!limiter || typeof limiter.limit !== 'function') {
+    console.warn('UPLOAD_RATE_LIMITER binding unavailable — rate limiting disabled (fail-open).');
+    return null;
+  }
+  try {
+    const ip = request.headers.get('cf-connecting-ip') || 'unknown';
+    const { success } = await limiter.limit({ key: ip });
+    if (!success) {
+      return corsResponse(
+        { error: 'Too many submissions from this connection. Please wait a minute and try again.' },
+        429, request, env
+      );
+    }
+  } catch (err) {
+    console.warn('Rate limit check failed — allowing request (fail-open):', err.message);
+  }
+  return null;
 }
 
 // =============================================================
@@ -195,7 +234,7 @@ async function validateTurnstile(token, request, env) {
 // CLAIM CREATION — PORTAL PATH
 // =============================================================
 
-async function createClaimFromPortal(data, submissionPayload, files, env, bankingScrub = {}) {
+async function createClaimFromPortal(data, submissionPayload, files, env, bankingScrub = {}, clientIp = null) {
   const claimRef = await generateClaimRef(env, data.insurer);
 
   const submittedRole = data.submitter_role === 'client' ? 'client' : 'broker';
@@ -249,6 +288,7 @@ async function createClaimFromPortal(data, submissionPayload, files, env, bankin
     claim_id:   claimId,
     actor_type: 'system',
     action:     'claim_received',
+    ip_address: clientIp,
     after_state: {
       source: 'web_portal',
       submitter_role: submittedRole,
@@ -264,6 +304,7 @@ async function createClaimFromPortal(data, submissionPayload, files, env, bankin
       claim_id:   claimId,
       actor_type: 'system',
       action:     'banking_details_redacted',
+      ip_address: clientIp,
       after_state: {
         source: 'web_portal',
         redaction_count: bankingScrub.redactionCount,
@@ -563,14 +604,14 @@ async function generateClaimRef(env, insurer) {
   return res.json();
 }
 
-async function auditLog(env, { claim_id = null, actor_id = null, actor_type, action, before_state = null, after_state = null, notes = null }) {
+async function auditLog(env, { claim_id = null, actor_id = null, actor_type, action, before_state = null, after_state = null, notes = null, ip_address = null }) {
   // BANKING BOUNDARY: scrub state objects before insert (email subjects and
   // free text can carry banking details).
   const safeBefore = before_state ? sanitiseAiOutput(before_state).sanitised : null;
   const safeAfter  = after_state  ? sanitiseAiOutput(after_state).sanitised  : null;
   await supabaseInsert(env, 'audit_log', {
     claim_id, actor_id, actor_type, action,
-    before_state: safeBefore, after_state: safeAfter, notes,
+    before_state: safeBefore, after_state: safeAfter, notes, ip_address,
   }).catch(err => console.error('Audit insert failed:', err));
 }
 
@@ -643,20 +684,29 @@ function jsonResponse(data, status = 200) {
   });
 }
 
-function corsResponse(data, status = 200, request) {
-  const origin = request?.headers.get('Origin');
-  const allowed = PORTAL_ORIGINS.includes('*') ? '*'
-    : (origin && PORTAL_ORIGINS.includes(origin)) ? origin : PORTAL_ORIGINS[0];
+function parseAllowedOrigins(env) {
+  return String(env?.PORTAL_ORIGINS || '')
+    .split(',')
+    .map(s => s.trim())
+    .filter(Boolean);
+}
+
+function corsResponse(data, status = 200, request, env) {
+  const origin  = request?.headers.get('Origin');
+  const allowed = parseAllowedOrigins(env);
+  const headers = {
+    'Content-Type': 'application/json',
+    'Vary': 'Origin',
+  };
+  // Echo the origin ONLY when allowlisted. Otherwise no CORS headers are
+  // set and the browser blocks the response.
+  if (origin && allowed.includes(origin)) {
+    headers['Access-Control-Allow-Origin']  = origin;
+    headers['Access-Control-Allow-Methods'] = 'POST, OPTIONS';
+    headers['Access-Control-Allow-Headers'] = 'Content-Type';
+  }
   const body = data !== null ? JSON.stringify(data) : null;
-  return new Response(body, {
-    status,
-    headers: {
-      'Content-Type': 'application/json',
-      'Access-Control-Allow-Origin':  allowed,
-      'Access-Control-Allow-Methods': 'POST, OPTIONS',
-      'Access-Control-Allow-Headers': 'Content-Type',
-    },
-  });
+  return new Response(body, { status, headers });
 }
 
 async function logSystemError(env, err, path) {

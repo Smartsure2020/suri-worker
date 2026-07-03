@@ -2,6 +2,10 @@
 
 **Status: hard, non-negotiable system boundary. Approved by product owner, 3 July 2026 (Phase 0).**
 
+Broader POPIA/data-retention position: see [PRIVACY.md](PRIVACY.md). This
+document governs the banking/payment subset, which is stricter: banking
+details are never stored at all, regardless of retention policy.
+
 ## The boundary
 
 Suri is a claims intake and decision-support system. Suri must **not**:

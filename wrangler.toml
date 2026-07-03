@@ -15,6 +15,19 @@ binding    = "SURI_QUEUE"
 # Do NOT put real values here — use `wrangler secret put VAR_NAME`
 [vars]
 ENVIRONMENT = "production"
+# Comma-separated allowlist of browser origins for the public portal.
+# MUST be replaced with the real production portal domain(s) before deploy,
+# e.g. "https://claims.smartsure.co.za" or the Vercel production URL.
+# Add preview domains explicitly if needed. NEVER include localhost here —
+# use `wrangler dev --var PORTAL_ORIGINS:http://localhost:3000` locally.
+PORTAL_ORIGINS = "https://REPLACE-WITH-PORTAL-DOMAIN.example"
+
+# Upload rate limiting: 5 requests per 60s per client IP on /upload.
+# The worker FAILS OPEN if this binding is unavailable (Turnstile still gates).
+[[ratelimits]]
+name = "UPLOAD_RATE_LIMITER"
+namespace_id = "1001"
+simple = { limit = 5, period = 60 }
 
 # Secrets (set with: wrangler secret put SECRET_NAME)
 # SUPABASE_URL
