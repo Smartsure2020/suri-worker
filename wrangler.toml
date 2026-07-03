@@ -22,12 +22,22 @@ ENVIRONMENT = "production"
 # use `wrangler dev --var PORTAL_ORIGINS:http://localhost:3000` locally.
 PORTAL_ORIGINS = "https://REPLACE-WITH-PORTAL-DOMAIN.example"
 
+# Public URL of THIS worker (no trailing slash). Used by the M365 renewal
+# cron to (re)create the Graph webhook subscription if it lapses.
+# REPLACE before deploy, e.g. "https://suri-worker.<account>.workers.dev".
+WORKER_PUBLIC_URL = "https://REPLACE-WITH-WORKER-URL.example"
+
 # Upload rate limiting: 5 requests per 60s per client IP on /upload.
 # The worker FAILS OPEN if this binding is unavailable (Turnstile still gates).
 [[ratelimits]]
 name = "UPLOAD_RATE_LIMITER"
 namespace_id = "1001"
 simple = { limit = 5, period = 60 }
+
+# M365 Graph subscription auto-renewal (subscriptions max out at ~3 days;
+# renewing every 12h keeps a wide safety margin).
+[triggers]
+crons = ["0 */12 * * *"]
 
 # Secrets (set with: wrangler secret put SECRET_NAME)
 # SUPABASE_URL
@@ -37,7 +47,8 @@ simple = { limit = 5, period = 60 }
 # AZURE_CLIENT_SECRET
 # SURI_MAILBOX              (e.g. claims@smartsure.co.za)
 # M365_WEBHOOK_SECRET       (random string, set in M365 subscription + here)
-# PORTAL_API_KEY            (random string, used by Cloudflare Pages frontend)
+# TURNSTILE_SECRET          (Cloudflare Turnstile secret key)
+# ADMIN_DIAGNOSTICS_SECRET  (random string; /admin/diagnostics is disabled/404 until set)
 
 # Routes — update to your actual domain
 

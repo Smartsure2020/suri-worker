@@ -85,10 +85,41 @@ insurance record-keeping obligations (§3) — typically restriction rather than
 erasure while the retention period runs. Audit-log entries are retained (they
 evidence processing itself); this position should be confirmed by compliance.
 
-## 7. Not yet implemented (future work, noted so it is not assumed)
+## 7. Retention/cleanup design (DESIGN ONLY — nothing is auto-deleted today)
 
-- Automated retention/cleanup jobs (Phase 3+): nothing is auto-deleted today.
-- Phase 2B: bucket privacy enforcement codified in a migration, RLS write
-  tightening, audit-log immutability triggers.
+Status: no automated deletion exists or is scheduled. This section records the
+approved design for when compliance signs off the retention periods in §3.
+
+**Proposed approach — controlled maintenance migration, not a background job:**
+
+1. A cleanup run is a reviewed, versioned SQL migration executed manually
+   (quarterly cadence proposed), never an unattended cron.
+2. Selection: claims with `status = 'closed'` whose closure date is older than
+   the signed-off retention period, excluding any claim with an open/escalated
+   `fraud_flags` row or a recorded legal hold (hold mechanism to be added when
+   cleanup is first implemented).
+3. Deletion order per claim: Storage objects under `claims/<claim_id>/` →
+   `claim_documents` → `claim_ai_outputs` → `inbound_emails` → `broker_emails`
+   / `handler_notifications` → the `claims` row (FK cascades assist).
+4. Every run inserts a summary `audit_log` row (`retention_cleanup_executed`:
+   counts and claim_refs only) BEFORE deleting, so the audit trail records
+   what was removed and under which policy version.
+
+**Interaction with audit-log immutability (Phase 2B triggers):**
+`audit_log` UPDATE/DELETE are blocked by triggers, including for privileged
+roles. Any audit-log retention action therefore REQUIRES a controlled
+maintenance migration that (a) records the intent in `audit_log` first,
+(b) drops the `trg_audit_log_no_update`/`trg_audit_log_no_delete` triggers,
+(c) performs the approved deletion, and (d) recreates the triggers — all in
+one reviewed transaction. This is the only sanctioned path; ad-hoc trigger
+removal is a policy violation.
+
+**Must NEVER be deleted automatically without explicit written approval:**
+- `audit_log` rows (any)
+- `aol_packs` (delete-blocked at DB level; Phase D relevance)
+- Any claim with an open fraud flag, dispute, complaint, or legal hold
+- `system_constants` (no DELETE policy exists; operational state lives here)
+
+**Also outstanding (unchanged):**
 - Anthropic zero-data-retention confirmation (contractual action).
 - Supabase region confirmation and s72 transfer register entries.

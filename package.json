@@ -1,6 +1,6 @@
 {
   "name": "suri-worker",
-  "version": "0.1.0",
+  "version": "0.3.0",
   "private": true,
   "type": "module",
   "description": "Suri claims intake — Cloudflare Worker + queue processor. Tests use Node's built-in test runner (no dependencies): npm test",

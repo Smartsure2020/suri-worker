@@ -9,6 +9,19 @@
 // =============================================================
 
 import { sanitiseAiOutput } from './banking-scrubber.js';
+import { renewM365Subscription, readSubscriptionState } from './m365-renewal.js';
+
+const SURI_WORKER_VERSION = '0.3.0-phase3';
+
+// Env vars/secrets the ingestion worker needs to be fully operational.
+// /health reports NAMES of missing ones only — never values.
+const REQUIRED_ENV_VARS = [
+  'SUPABASE_URL', 'SUPABASE_SERVICE_KEY', 'TURNSTILE_SECRET',
+  'M365_WEBHOOK_SECRET', 'AZURE_TENANT_ID', 'AZURE_CLIENT_ID',
+  'AZURE_CLIENT_SECRET', 'SURI_MAILBOX',
+];
+
+const STUCK_PROCESSING_HOURS = 2;
 
 const ALLOWED_MIME_TYPES = new Set([
   'application/pdf',
@@ -50,7 +63,10 @@ export default {
         return await handleWebhookValidation(request);
       }
       if (url.pathname === '/health') {
-        return jsonResponse({ status: 'ok', service: 'suri-worker', ts: new Date().toISOString() });
+        return await handleHealth(env);
+      }
+      if (url.pathname === '/admin/diagnostics' && request.method === 'GET') {
+        return await handleDiagnostics(request, env);
       }
       return jsonResponse({ error: 'Not found' }, 404);
     } catch (err) {
@@ -59,7 +75,116 @@ export default {
       return jsonResponse({ error: 'Internal server error' }, 500);
     }
   },
+
+  // Cron (see [triggers] in wrangler.toml): keeps the M365 Graph webhook
+  // subscription alive. Without this, email intake dies every ~3 days.
+  async scheduled(controller, env, ctx) {
+    const result = await renewM365Subscription(env);
+    console.log(`M365 subscription renewal run: ${result.status}${result.reason ? ` (${result.reason})` : ''}`);
+  },
 };
+
+// =============================================================
+// HEALTH CHECK
+// Safe for operational use: reports presence/absence and statuses only.
+// Never includes secret values, claim data, or model output.
+// =============================================================
+
+async function handleHealth(env) {
+  const missing = REQUIRED_ENV_VARS.filter(k => !env?.[k]);
+
+  let supabase = 'fail';
+  if (env?.SUPABASE_URL && env?.SUPABASE_SERVICE_KEY) {
+    try {
+      const res = await fetch(
+        `${env.SUPABASE_URL}/rest/v1/system_constants?select=key&limit=1`,
+        { headers: supabaseHeaders(env) }
+      );
+      supabase = res.ok ? 'ok' : 'fail';
+    } catch {
+      supabase = 'fail';
+    }
+  }
+
+  // M365 subscription freshness from persisted state (renewed by cron).
+  let m365Subscription = { status: 'unknown' };
+  if (supabase === 'ok') {
+    const state = await readSubscriptionState(env);
+    if (state?.expiration) {
+      const msLeft = new Date(state.expiration).getTime() - Date.now();
+      m365Subscription = {
+        status: msLeft <= 0 ? 'expired' : (msLeft < 12 * 3600 * 1000 ? 'expiring' : 'ok'),
+        expiration: state.expiration,
+      };
+    }
+  }
+
+  const checks = {
+    supabase,
+    env_config: missing.length ? { status: 'incomplete', missing } : { status: 'ok' },
+    queue_binding: env?.SURI_QUEUE ? 'present' : 'missing',
+    rate_limiter: env?.UPLOAD_RATE_LIMITER ? 'present' : 'missing (fail-open by design)',
+    m365_subscription: m365Subscription,
+    // The queue consumer runs in a separate worker and cannot be observed
+    // from here. Explicitly unknown — use /admin/diagnostics for DB-visible
+    // processing signals (stuck/error claims).
+    processor: 'unknown',
+  };
+
+  const healthy = supabase === 'ok' && missing.length === 0 && !!env?.SURI_QUEUE;
+  return jsonResponse({
+    status: healthy ? 'ok' : 'degraded',
+    service: 'suri-worker',
+    version: SURI_WORKER_VERSION,
+    ts: new Date().toISOString(),
+    checks,
+  }, healthy ? 200 : 503);
+}
+
+// =============================================================
+// ADMIN DIAGNOSTICS
+// Protected by ADMIN_DIAGNOSTICS_SECRET (x-suri-admin-key header).
+// Disabled (404) when the secret is not configured. Returns counts,
+// claim refs and timestamps ONLY — never personal data, documents,
+// banking content, prompts, or model output.
+// =============================================================
+
+async function handleDiagnostics(request, env) {
+  const secret = env?.ADMIN_DIAGNOSTICS_SECRET;
+  if (!secret) return jsonResponse({ error: 'Not found' }, 404);
+  const provided = request.headers.get('x-suri-admin-key') || '';
+  if (provided !== secret) return jsonResponse({ error: 'Unauthorised' }, 401);
+
+  const sinceIso = (days) => new Date(Date.now() - days * 86400 * 1000).toISOString();
+  const stuckBefore = new Date(Date.now() - STUCK_PROCESSING_HOURS * 3600 * 1000).toISOString();
+
+  const [stuck, errored, failed7d, redactions7d, redactions30d] = await Promise.all([
+    sbRows(env, `claims?status=eq.processing&updated_at=lt.${stuckBefore}&select=claim_ref,updated_at&order=updated_at.asc&limit=50`),
+    sbRows(env, `claims?status=eq.error&select=claim_ref,updated_at&order=updated_at.desc&limit=50`),
+    sbRows(env, `audit_log?action=eq.ai_processing_failed&created_at=gte.${sinceIso(7)}&select=claim_id,created_at&order=created_at.desc&limit=50`),
+    sbRows(env, `audit_log?action=eq.banking_details_redacted&created_at=gte.${sinceIso(7)}&select=created_at&limit=1000`),
+    sbRows(env, `audit_log?action=eq.banking_details_redacted&created_at=gte.${sinceIso(30)}&select=created_at&limit=1000`),
+  ]);
+
+  return jsonResponse({
+    generated_at: new Date().toISOString(),
+    thresholds: { stuck_processing_hours: STUCK_PROCESSING_HOURS },
+    stuck_processing: { count: stuck.length, claims: stuck },
+    error_claims: { count: errored.length, claims: errored },
+    ai_processing_failures_7d: { count: failed7d.length, latest: failed7d[0]?.created_at || null },
+    banking_redactions: {
+      last_7_days: redactions7d.length,
+      last_30_days: redactions30d.length,
+      note: 'Counts only — redacted content is never stored or returned. Persistently high counts indicate prompt/model drift; see BOUNDARY.md.',
+    },
+  });
+}
+
+async function sbRows(env, path) {
+  const res = await fetch(`${env.SUPABASE_URL}/rest/v1/${path}`, { headers: supabaseHeaders(env) });
+  if (!res.ok) throw new Error(`Diagnostics query failed: ${res.status}`);
+  return res.json();
+}
 
 // =============================================================
 // WEB PORTAL UPLOAD — TURNSTILE-AUTHENTICATED
@@ -87,10 +212,23 @@ async function handleWebPortalUpload(request, env, ctx) {
     return corsResponse({ error: 'Captcha verification failed' }, 401, request, env);
   }
 
-  // 2. Build submission payload from all form fields (preserves what broker typed)
+  // 2. Idempotency: the portal sends one key per form session so retries and
+  //    double-submits map to the same claim. Invalid/absent keys are ignored.
+  //    Lookup happens only after captcha passed, so unauthenticated callers
+  //    cannot probe claim references.
+  const rawIdemKey = formData.get('submission_idempotency_key');
+  const idempotencyKey =
+    typeof rawIdemKey === 'string' && /^[A-Za-z0-9-]{8,64}$/.test(rawIdemKey)
+      ? rawIdemKey : null;
+  if (idempotencyKey) {
+    const existing = await findClaimByIdempotencyKey(env, idempotencyKey);
+    if (existing) return duplicateResponse(existing.claim_ref, request, env);
+  }
+
+  // 3. Build submission payload from all form fields (preserves what broker typed)
   const submissionPayload = {};
   for (const [key, value] of formData.entries()) {
-    if (key === 'documents' || key === 'cf-turnstile-response') continue;
+    if (key === 'documents' || key === 'cf-turnstile-response' || key === 'submission_idempotency_key') continue;
     submissionPayload[key] = value;
   }
 
@@ -152,9 +290,15 @@ async function handleWebPortalUpload(request, env, ctx) {
   const clientIp = request.headers.get('cf-connecting-ip') || null;
 
   // 6. Create claim + upload docs + queue processing
-  const { claimId, claimRef } = await createClaimFromPortal(
-    dataScrub.sanitised, payloadScrub.sanitised, files, env, bankingScrub, clientIp
+  const created = await createClaimFromPortal(
+    dataScrub.sanitised, payloadScrub.sanitised, files, env, bankingScrub, clientIp, idempotencyKey
   );
+
+  // Insert race lost to a concurrent identical submission — return the
+  // winner's reference; that claim is already queued for processing.
+  if (created.duplicate) return duplicateResponse(created.claimRef, request, env);
+
+  const { claimId, claimRef } = created;
 
   ctx.waitUntil(
     env.SURI_QUEUE.send({ type: 'process_claim', claim_id: claimId, source: 'web_portal' })
@@ -165,6 +309,28 @@ async function handleWebPortalUpload(request, env, ctx) {
     claim_ref: claimRef,
     message: 'Your claim has been received. You will receive a confirmation email shortly.',
   }, 202, request, env);
+}
+
+// =============================================================
+// IDEMPOTENCY HELPERS
+// =============================================================
+
+async function findClaimByIdempotencyKey(env, key) {
+  const rows = await supabaseQuery(env, 'claims', 'select', {
+    submission_idempotency_key: `eq.${key}`,
+    select: 'id,claim_ref',
+    limit: '1',
+  });
+  return rows?.length ? rows[0] : null;
+}
+
+function duplicateResponse(claimRef, request, env) {
+  return corsResponse({
+    status: 'received',
+    duplicate: true,
+    claim_ref: claimRef,
+    message: 'This claim was already received. Your reference is unchanged.',
+  }, 200, request, env);
 }
 
 // =============================================================
@@ -234,14 +400,17 @@ async function validateTurnstile(token, request, env) {
 // CLAIM CREATION — PORTAL PATH
 // =============================================================
 
-async function createClaimFromPortal(data, submissionPayload, files, env, bankingScrub = {}, clientIp = null) {
+async function createClaimFromPortal(data, submissionPayload, files, env, bankingScrub = {}, clientIp = null, idempotencyKey = null) {
   const claimRef = await generateClaimRef(env, data.insurer);
 
   const submittedRole = data.submitter_role === 'client' ? 'client' : 'broker';
 
-  const claimRecord = await supabaseInsert(env, 'claims', {
-    claim_ref:            claimRef,
-    status:               'received',
+  let claimRecord;
+  try {
+    claimRecord = await supabaseInsert(env, 'claims', {
+      claim_ref:            claimRef,
+      status:               'received',
+      submission_idempotency_key: idempotencyKey,
     banking_details_detected: bankingScrub.bankingDetected || false,
     banking_details_detected_notes: bankingScrub.bankingDetected
       ? 'Banking details detected in portal submission text and redacted before storage. Content not retained by Suri.'
@@ -270,7 +439,21 @@ async function createClaimFromPortal(data, submissionPayload, files, env, bankin
     invoice_or_quote:     data.invoice_or_quote,
     invoice_quote_amount: data.invoice_quote_amount,
     vat_amount:           data.vat_amount,
-  });
+    });
+  } catch (err) {
+    // Unique-violation race: a concurrent identical submission won the
+    // insert. Return the winner's claim instead of failing; the caller
+    // skips document upload and queueing for duplicates.
+    if (
+      idempotencyKey &&
+      /duplicate key|23505/i.test(err.message || '') &&
+      /idempotency/i.test(err.message || '')
+    ) {
+      const winner = await findClaimByIdempotencyKey(env, idempotencyKey);
+      if (winner) return { claimId: winner.id, claimRef: winner.claim_ref, duplicate: true };
+    }
+    throw err;
+  }
 
   const claimId = claimRecord.id;
 
