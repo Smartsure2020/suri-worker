@@ -23,6 +23,7 @@
 
 import { runRulesEngine, RULES_ENGINE_VERSION } from './rules-engine.js';
 import { sanitiseAiOutput, safeLog } from './banking-scrubber.js';
+import { manageRfiDrafts } from './rfi-drafts.js';
 
 const CLAUDE_MODEL    = 'claude-opus-4-8';
 const PROMPT_VERSION  = 'v2.1-doc-index';
@@ -199,6 +200,12 @@ async function processClaim(claimId, source, env) {
 
   // 16. Store draft broker email (still gated by handler approval in Phase D)
   await storeBrokerEmail(env, claimId, claim, brokerEmail);
+
+  // 16b. Missing-document (RFI) draft management — Phase C2, DRAFT-ONLY.
+  //      Creates/supersedes RFI drafts (broker_emails + an unsent Graph
+  //      reply draft in the Outlook thread). Never sends. Never blocks
+  //      the claim pipeline.
+  await manageRfiDrafts(env, { ...claim, ...claimUpdates, id: claimId }, completenessResult);
 
   // 17. Audit
   await auditLog(env, {
@@ -680,6 +687,11 @@ async function storeAiOutput(env, claimId, outputData) {
 }
 
 async function storeBrokerEmail(env, claimId, claim, brokerEmail) {
+  // One registration draft per claim: reprocessing runs (e.g. after a
+  // follow-up email attaches new documents) must not duplicate it.
+  const existing = await supabaseGet(env,
+    `broker_emails?claim_id=eq.${claimId}&email_type=eq.registration&select=id&limit=1`);
+  if (existing.length) return;
   await supabaseInsert(env, 'broker_emails', {
     claim_id: claimId,
     email_type: 'registration',

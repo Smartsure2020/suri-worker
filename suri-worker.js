@@ -10,8 +10,21 @@
 
 import { sanitiseAiOutput } from './banking-scrubber.js';
 import { renewM365Subscription, readSubscriptionState } from './m365-renewal.js';
+import { loadSystemConstant } from './rules-engine.js';
+import {
+  classifyEmail, extractClaimRef, isAutoReply,
+  parseReferencedMessageIds, emailBodyText,
+} from './email-triage.js';
 
-const SURI_WORKER_VERSION = '0.3.0-phase3';
+// Outlook categories Suri applies so the mailbox itself shows what
+// happened to each email. Metadata only — never sends anything.
+const CATEGORY_NEW_CLAIM    = 'Suri/New claim';
+const CATEGORY_ATTACHED     = 'Suri/Attached';
+const CATEGORY_NEEDS_REVIEW = 'Suri/Needs review';
+const CATEGORY_NOT_CLAIM    = 'Suri/Not claim';
+const CATEGORY_AUTO_REPLY   = 'Suri/Ignored auto-reply';
+
+const SURI_WORKER_VERSION = '0.4.0-c1';
 
 // Env vars/secrets the ingestion worker needs to be fully operational.
 // /health reports NAMES of missing ones only — never values.
@@ -563,25 +576,423 @@ export async function processEmailNotification(notification, env) {
     });
     return;
   }
-  if (!isLikelyClaimEmail(email)) {
-    // Audit skipped emails so non-matching claim emails do not silently vanish.
-    await auditLog(env, {
-      actor_type: 'system', action: 'email_skipped_not_claim',
-      after_state: {
-        message_id: messageId,
-        from: email.from?.emailAddress?.address || '',
-        subject: email.subject || '',
-      },
-      notes: 'Inbound email did not match claim keywords and was not ingested. Review the mailbox if this was a genuine claim.',
-    });
-    return;
-  }
-  const attachments = await fetchGraphAttachments(messageId, env);
-  const { claimId } = await createClaimFromEmail(email, attachments, env);
-  await env.SURI_QUEUE.send({ type: 'process_claim', claim_id: claimId, source: 'email' });
+  await triageAndRouteEmail(email, env);
 }
 
-async function createClaimFromEmail(email, attachments, env) {
+// =============================================================
+// EMAIL TRIAGE & ROUTING (Phase C1)
+// Stage 1: deterministic checks (free, safe). Stage 2: Haiku triage.
+// Follow-ups attach to existing claims — they NEVER create new ones.
+// Uncertain/ambiguous cases become review_items, visibly categorised.
+// Exported for tests.
+// =============================================================
+
+export async function triageAndRouteEmail(email, env) {
+  const from = (email.from?.emailAddress?.address || '').toLowerCase();
+
+  // Stage 1a — auto-reply/bounce suppression (prevents loops and noise)
+  if (isAutoReply(email)) {
+    await auditLog(env, {
+      actor_type: 'system', action: 'auto_reply_suppressed',
+      after_state: { message_id: email.id, from, subject: email.subject || '' },
+    });
+    await applyCategory(env, email.id, CATEGORY_AUTO_REPLY);
+    return { outcome: 'auto_reply_suppressed' };
+  }
+
+  // Stage 1b — sender denylist (optional, from system_constants)
+  const denylist = await loadSystemConstant(env, 'SURI_SENDER_DENYLIST', []);
+  if (Array.isArray(denylist) && from && denylist.includes(from)) {
+    await auditLog(env, {
+      actor_type: 'system', action: 'email_skipped_not_claim',
+      after_state: { message_id: email.id, from, subject: email.subject || '', reason: 'sender_denylisted' },
+    });
+    await applyCategory(env, email.id, CATEGORY_NOT_CLAIM);
+    return { outcome: 'denylisted' };
+  }
+
+  const bodyText = emailBodyText(email);
+
+  // Stage 1c — deterministic follow-up matching (rungs 1–3)
+  const det = await findDeterministicMatch(email, bodyText, env);
+  if (det?.claim) {
+    return attachFollowupToClaim(email, det.claim, det.method, env, {
+      classification: 'follow_up', confidence: 1, reason: `deterministic:${det.method}`,
+    });
+  }
+  if (det?.refNotFound) {
+    // A claim ref is quoted but no such claim exists — human must look.
+    const inboundEmailId = await storeUnlinkedEmail(email, env, {
+      classification: 'follow_up', confidence: 1, reason: `claim ref ${det.refNotFound} not found`,
+    });
+    await createReviewItem(env, {
+      inbound_email_id: inboundEmailId,
+      reasons: ['claim_ref_not_found'],
+      notes: `Email quotes claim ref ${det.refNotFound}, which does not exist in Suri.`,
+    });
+    await auditLog(env, {
+      actor_type: 'system', action: 'followup_unmatched',
+      after_state: { message_id: email.id, from, quoted_ref: det.refNotFound },
+    });
+    await applyCategory(env, email.id, CATEGORY_NEEDS_REVIEW);
+    return { outcome: 'ref_not_found' };
+  }
+
+  // Stage 2 — AI triage (cheap/fast model; never throws, falls back to 'uncertain')
+  const attachmentNames = await fetchGraphAttachmentNames(email.id, env);
+  const triage = await classifyEmail({ ...email, attachmentNames }, env);
+  const threshold = await loadSystemConstant(env, 'TRIAGE_CONFIDENCE_THRESHOLD', 0.7);
+
+  await auditLog(env, {
+    actor_type: 'system', action: 'email_triaged',
+    after_state: {
+      message_id: email.id, from,
+      classification: triage.classification,
+      confidence: triage.confidence,
+      escalation_flags: triage.escalation_flags,
+      model: triage.model,
+      reason: triage.reason,
+    },
+  });
+
+  switch (triage.classification) {
+    case 'follow_up':
+    case 'status_query':
+      return routeFollowup(email, triage, from, env);
+
+    case 'new_claim': {
+      if (triage.confidence < threshold) {
+        return escalateEmail(email, env, triage, ['low_triage_confidence'],
+          `Triage says new_claim but confidence ${triage.confidence.toFixed(2)} is below threshold ${threshold}.`);
+      }
+      const duplicate = await detectPossibleDuplicate(env, from, triage);
+      if (duplicate) {
+        const inboundEmailId = await storeUnlinkedEmail(email, env, triage);
+        await createReviewItem(env, {
+          inbound_email_id: inboundEmailId,
+          suggested_claim_id: duplicate.id,
+          reasons: ['possible_duplicate', ...triage.escalation_flags],
+          notes: `Looks like a new claim but may duplicate ${duplicate.claim_ref} (${duplicate.matched_on}). No claim created.`,
+        });
+        await auditLog(env, {
+          actor_type: 'system', action: 'possible_duplicate_flagged',
+          after_state: { message_id: email.id, from, existing_claim_ref: duplicate.claim_ref, matched_on: duplicate.matched_on },
+        });
+        await applyCategory(env, email.id, CATEGORY_NEEDS_REVIEW);
+        return { outcome: 'possible_duplicate' };
+      }
+      const attachments = await fetchGraphAttachments(email.id, env);
+      const { claimId, inboundEmailId } = await createClaimFromEmail(email, attachments, env, triage);
+      await env.SURI_QUEUE.send({ type: 'process_claim', claim_id: claimId, source: 'email' });
+      await applyCategory(env, email.id, CATEGORY_NEW_CLAIM);
+      if (triage.escalation_flags.length) {
+        await createReviewItem(env, {
+          inbound_email_id: inboundEmailId, claim_id: claimId,
+          reasons: triage.escalation_flags,
+          notes: 'Claim was created, but the email language needs human attention.',
+        });
+        await applyCategory(env, email.id, CATEGORY_NEEDS_REVIEW);
+      }
+      return { outcome: 'new_claim', claimId };
+    }
+
+    case 'not_claim': {
+      if (triage.confidence < threshold) {
+        return escalateEmail(email, env, triage, ['uncertain_classification'],
+          `Triage says not_claim but confidence ${triage.confidence.toFixed(2)} is below threshold ${threshold}.`);
+      }
+      await auditLog(env, {
+        actor_type: 'system', action: 'email_skipped_not_claim',
+        after_state: { message_id: email.id, from, subject: email.subject || '', triage_reason: triage.reason },
+        notes: 'Triage classified this email as not claim-related. Review the mailbox category if this was a genuine claim.',
+      });
+      await applyCategory(env, email.id, CATEGORY_NOT_CLAIM);
+      return { outcome: 'not_claim' };
+    }
+
+    default: // 'uncertain'
+      return escalateEmail(email, env, triage, ['uncertain_classification'],
+        `Triage could not classify this email (${triage.reason}).`);
+  }
+}
+
+// Rung 4 (sender + exact policy number, exactly one open claim) plus the
+// escalation paths for everything fuzzier.
+async function routeFollowup(email, triage, from, env) {
+  if (triage.policy_number && from) {
+    const rows = await supabaseSelect(env,
+      `claims?broker_email=eq.${encodeURIComponent(from)}` +
+      `&policy_number=eq.${encodeURIComponent(triage.policy_number)}` +
+      `&status=not.in.(closed,error)&select=id,claim_ref,status`);
+    if (rows.length === 1) {
+      return attachFollowupToClaim(email, rows[0], 'policy_sender', env, triage);
+    }
+    if (rows.length > 1) {
+      const inboundEmailId = await storeUnlinkedEmail(email, env, triage);
+      await createReviewItem(env, {
+        inbound_email_id: inboundEmailId,
+        reasons: ['ambiguous_followup_match', ...triage.escalation_flags],
+        notes: `Sender + policy number matches ${rows.length} open claims: ${rows.map(r => r.claim_ref).join(', ')}. Human must pick.`,
+      });
+      await auditLog(env, {
+        actor_type: 'system', action: 'followup_unmatched',
+        after_state: { message_id: email.id, from, reason: 'ambiguous_policy_match', candidate_count: rows.length },
+      });
+      await applyCategory(env, email.id, CATEGORY_NEEDS_REVIEW);
+      return { outcome: 'ambiguous_followup' };
+    }
+  }
+
+  // AI-suggested ref (e.g. read off an attachment) — suggestion only, never auto-attach.
+  let suggestedClaimId = null;
+  let suggestionNote = '';
+  if (triage.claim_ref) {
+    const rows = await supabaseSelect(env,
+      `claims?claim_ref=eq.${encodeURIComponent(triage.claim_ref)}&select=id,claim_ref&limit=1`);
+    if (rows.length === 1) {
+      suggestedClaimId = rows[0].id;
+      suggestionNote = ` AI suggests ${rows[0].claim_ref} — confirm before attaching.`;
+    }
+  }
+
+  const inboundEmailId = await storeUnlinkedEmail(email, env, triage);
+  await createReviewItem(env, {
+    inbound_email_id: inboundEmailId,
+    suggested_claim_id: suggestedClaimId,
+    reasons: ['unmatched_followup', ...triage.escalation_flags],
+    notes: `Triage: ${triage.classification} (${triage.reason}). No deterministic claim match.${suggestionNote}`,
+  });
+  await auditLog(env, {
+    actor_type: 'system', action: 'followup_unmatched',
+    after_state: { message_id: email.id, from, suggested_claim_id: suggestedClaimId },
+  });
+  await applyCategory(env, email.id, CATEGORY_NEEDS_REVIEW);
+  return { outcome: 'unmatched_followup' };
+}
+
+async function escalateEmail(email, env, triage, reasons, notes) {
+  const inboundEmailId = await storeUnlinkedEmail(email, env, triage);
+  await createReviewItem(env, {
+    inbound_email_id: inboundEmailId,
+    reasons: [...reasons, ...triage.escalation_flags],
+    notes,
+  });
+  await applyCategory(env, email.id, CATEGORY_NEEDS_REVIEW);
+  return { outcome: 'escalated', reasons };
+}
+
+// Deterministic rungs 1–3: claim ref in text, known conversation thread,
+// In-Reply-To/References header pointing at a stored message.
+async function findDeterministicMatch(email, bodyText, env) {
+  const ref = extractClaimRef(`${email.subject || ''}\n${bodyText}`);
+  if (ref) {
+    const rows = await supabaseSelect(env,
+      `claims?claim_ref=eq.${encodeURIComponent(ref)}&select=id,claim_ref,status&limit=1`);
+    if (rows.length) return { claim: rows[0], method: 'claim_ref' };
+    return { refNotFound: ref };
+  }
+  if (email.conversationId) {
+    const rows = await supabaseSelect(env,
+      `inbound_emails?thread_id=eq.${encodeURIComponent(email.conversationId)}&claim_id=not.is.null&select=claim_id&limit=1`);
+    if (rows.length) {
+      const claim = await getClaimById(env, rows[0].claim_id);
+      if (claim) return { claim, method: 'thread' };
+    }
+  }
+  for (const refId of parseReferencedMessageIds(email).slice(0, 5)) {
+    const rows = await supabaseSelect(env,
+      `inbound_emails?internet_message_id=eq.${encodeURIComponent(refId)}&claim_id=not.is.null&select=claim_id&limit=1`);
+    if (rows.length) {
+      const claim = await getClaimById(env, rows[0].claim_id);
+      if (claim) return { claim, method: 'reply_headers' };
+    }
+  }
+  return null;
+}
+
+// Attaches a follow-up email (and its attachments) to an EXISTING claim.
+// Never creates a claim. Re-queues processing only when new documents arrived.
+async function attachFollowupToClaim(email, claim, method, env, triage = {}) {
+  const emailScrub = sanitiseAiOutput({
+    subject:   email.subject || '',
+    body_text: email.body?.contentType === 'text' ? email.body.content : null,
+    body_html: email.body?.contentType === 'html' ? email.body.content : null,
+  });
+  const safeEmail = emailScrub.sanitised;
+
+  const inboundEmailRecord = await supabaseInsert(env, 'inbound_emails', {
+    claim_id:     claim.id,
+    from_address: email.from?.emailAddress?.address || '',
+    to_address:   email.toRecipients?.[0]?.emailAddress?.address || '',
+    subject:      safeEmail.subject,
+    body_text:    safeEmail.body_text,
+    body_html:    safeEmail.body_html,
+    message_id:   email.id,
+    internet_message_id: email.internetMessageId || null,
+    thread_id:    email.conversationId || null,
+    source:       'outlook',
+    raw_headers:  email.internetMessageHeaders || {},
+    received_at:  email.receivedDateTime || new Date().toISOString(),
+    triage_class: triage.classification || 'follow_up',
+    triage_confidence: triage.confidence ?? null,
+    triage_model: triage.model || null,
+    triage_reason: triage.reason || null,
+    matched_claim_id: claim.id,
+    match_method: method,
+  });
+
+  const attachments = await fetchGraphAttachments(email.id, env);
+  await uploadAttachments(attachments, claim.id, inboundEmailRecord.id, env);
+
+  await auditLog(env, {
+    claim_id: claim.id, actor_type: 'system', action: 'followup_attached',
+    after_state: {
+      message_id: email.id, claim_ref: claim.claim_ref,
+      match_method: method, attachment_count: attachments.length,
+    },
+  });
+
+  if (emailScrub.bankingDetected) {
+    await supabaseUpdate(env, 'claims', claim.id, {
+      banking_details_detected: true,
+      banking_details_detected_notes: 'Banking details detected in a follow-up email body and redacted before storage. Content not retained by Suri.',
+    });
+    await auditLog(env, {
+      claim_id: claim.id, actor_type: 'system', action: 'banking_details_redacted',
+      after_state: { source: 'followup_email', redaction_count: emailScrub.redactionCount, locations: emailScrub.locations },
+      notes: 'Banking details detected in follow-up email and redacted before storage. Content not retained by Suri.',
+    });
+    await createReviewItem(env, {
+      inbound_email_id: inboundEmailRecord.id, claim_id: claim.id,
+      reasons: ['banking_details_detected'],
+      notes: 'Informational: banking details appeared in a follow-up email and were redacted. Payments remain outside Suri.',
+    });
+  }
+
+  if (attachments.length > 0) {
+    await env.SURI_QUEUE.send({ type: 'process_claim', claim_id: claim.id, source: 'email_followup' });
+  }
+  await applyCategory(env, email.id, CATEGORY_ATTACHED);
+  return { outcome: 'attached', claimId: claim.id, method, attachmentCount: attachments.length };
+}
+
+// Stores an email that could not be safely routed (claim_id null) so review
+// items can reference it and message-id dedupe covers re-notifications.
+async function storeUnlinkedEmail(email, env, triage = {}) {
+  const emailScrub = sanitiseAiOutput({
+    subject:   email.subject || '',
+    body_text: email.body?.contentType === 'text' ? email.body.content : null,
+    body_html: email.body?.contentType === 'html' ? email.body.content : null,
+  });
+  const safeEmail = emailScrub.sanitised;
+  const record = await supabaseInsert(env, 'inbound_emails', {
+    from_address: email.from?.emailAddress?.address || '',
+    to_address:   email.toRecipients?.[0]?.emailAddress?.address || '',
+    subject:      safeEmail.subject,
+    body_text:    safeEmail.body_text,
+    body_html:    safeEmail.body_html,
+    message_id:   email.id,
+    internet_message_id: email.internetMessageId || null,
+    thread_id:    email.conversationId || null,
+    source:       'outlook',
+    raw_headers:  email.internetMessageHeaders || {},
+    received_at:  email.receivedDateTime || new Date().toISOString(),
+    triage_class: triage.classification || null,
+    triage_confidence: triage.confidence ?? null,
+    triage_model: triage.model || null,
+    triage_reason: triage.reason || null,
+  });
+  return record.id;
+}
+
+async function createReviewItem(env, { inbound_email_id = null, claim_id = null, suggested_claim_id = null, reasons, notes = null }) {
+  const uniqueReasons = [...new Set(reasons)];
+  await supabaseInsert(env, 'review_items', {
+    inbound_email_id, claim_id, suggested_claim_id,
+    reasons: uniqueReasons, notes,
+  });
+  await auditLog(env, {
+    claim_id, actor_type: 'system', action: 'review_item_opened',
+    after_state: { inbound_email_id, suggested_claim_id, reasons: uniqueReasons },
+    notes,
+  });
+}
+
+// Duplicate guard before creating a claim from a new_claim email:
+// (a) same sender + exact policy number on an open claim;
+// (b) same insured name + incident date within the configured window.
+async function detectPossibleDuplicate(env, from, triage) {
+  if (from && triage.policy_number) {
+    const rows = await supabaseSelect(env,
+      `claims?broker_email=eq.${encodeURIComponent(from)}` +
+      `&policy_number=eq.${encodeURIComponent(triage.policy_number)}` +
+      `&status=not.in.(closed,error)&select=id,claim_ref&limit=1`);
+    if (rows.length) return { ...rows[0], matched_on: 'sender + policy number' };
+  }
+  if (triage.insured_name && triage.incident_date) {
+    const windowDays = await loadSystemConstant(env, 'DUPLICATE_CLAIM_WINDOW_DAYS', 30);
+    const d = new Date(triage.incident_date).getTime();
+    if (!isNaN(d)) {
+      const fromDate = new Date(d - windowDays * 86400e3).toISOString().slice(0, 10);
+      const toDate   = new Date(d + windowDays * 86400e3).toISOString().slice(0, 10);
+      const rows = await supabaseSelect(env,
+        `claims?insured_name=ilike.${encodeURIComponent(triage.insured_name)}` +
+        `&incident_date=gte.${fromDate}&incident_date=lte.${toDate}` +
+        `&status=not.in.(closed,error)&select=id,claim_ref&limit=1`);
+      if (rows.length) return { ...rows[0], matched_on: 'insured name + incident date window' };
+    }
+  }
+  return null;
+}
+
+// Outlook category — metadata only, best-effort, never blocks the pipeline.
+async function applyCategory(env, messageId, category) {
+  try {
+    if (!env?.AZURE_TENANT_ID || !env?.SURI_MAILBOX) return;
+    const token = await getGraphToken(env);
+    const res = await fetch(
+      `https://graph.microsoft.com/v1.0/users/${env.SURI_MAILBOX}/messages/${messageId}`,
+      {
+        method: 'PATCH',
+        headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ categories: [category] }),
+      }
+    );
+    if (!res.ok) console.warn(`Category apply failed (${res.status}) for ${messageId}`);
+  } catch (err) {
+    console.warn('Category apply error (non-fatal):', err.message);
+  }
+}
+
+async function getClaimById(env, claimId) {
+  const rows = await supabaseSelect(env,
+    `claims?id=eq.${encodeURIComponent(claimId)}&select=id,claim_ref,status&limit=1`);
+  return rows.length ? rows[0] : null;
+}
+
+// Attachment names only (for the triage prompt) — cheap $select, no bytes.
+async function fetchGraphAttachmentNames(messageId, env) {
+  try {
+    const token = await getGraphToken(env);
+    const res = await fetch(
+      `https://graph.microsoft.com/v1.0/users/${env.SURI_MAILBOX}/messages/${messageId}/attachments?$select=name`,
+      { headers: { Authorization: `Bearer ${token}` } }
+    );
+    if (!res.ok) return [];
+    const data = await res.json();
+    return (data.value || []).map(a => a.name).filter(Boolean);
+  } catch {
+    return [];
+  }
+}
+
+async function supabaseSelect(env, pathAndQuery) {
+  const res = await fetch(`${env.SUPABASE_URL}/rest/v1/${pathAndQuery}`, { headers: supabaseHeaders(env) });
+  if (!res.ok) throw new Error(`Supabase select failed: ${res.status}`);
+  return res.json();
+}
+
+async function createClaimFromEmail(email, attachments, env, triage = {}) {
   // BANKING BOUNDARY — broker emails routinely quote supplier banking details
   // in the body. Redact before storage; keep only a detection flag. The
   // original email remains in the source mailbox for the payment workflow.
@@ -599,10 +1010,15 @@ async function createClaimFromEmail(email, attachments, env) {
     body_text:    safeEmail.body_text,
     body_html:    safeEmail.body_html,
     message_id:   email.id,
+    internet_message_id: email.internetMessageId || null,
     thread_id:    email.conversationId || null,
     source:       'outlook',
     raw_headers:  email.internetMessageHeaders || {},
     received_at:  email.receivedDateTime || new Date().toISOString(),
+    triage_class: triage.classification || null,
+    triage_confidence: triage.confidence ?? null,
+    triage_model: triage.model || null,
+    triage_reason: triage.reason || null,
   });
   const inboundEmailId = inboundEmailRecord.id;
 
@@ -703,7 +1119,7 @@ async function getGraphToken(env) {
 async function fetchGraphEmail(messageId, env) {
   const token = await getGraphToken(env);
   const res = await fetch(
-    `https://graph.microsoft.com/v1.0/users/${env.SURI_MAILBOX}/messages/${messageId}?$select=id,subject,from,toRecipients,body,receivedDateTime,conversationId,internetMessageHeaders`,
+    `https://graph.microsoft.com/v1.0/users/${env.SURI_MAILBOX}/messages/${messageId}?$select=id,subject,from,toRecipients,body,receivedDateTime,conversationId,internetMessageHeaders,internetMessageId`,
     { headers: { Authorization: `Bearer ${token}` } }
   );
   if (!res.ok) return null;
@@ -828,12 +1244,6 @@ async function validateFiles(files) {
   }
   if (total > MAX_TOTAL_SIZE_BYTES) errors.push('Total upload size exceeds 80MB limit');
   return errors;
-}
-
-function isLikelyClaimEmail(email) {
-  const subject = (email.subject || '').toLowerCase();
-  const keywords = ['claim','damage','loss','incident','accident','theft','hijack','flood','fire','geyser','hail'];
-  return keywords.some(kw => subject.includes(kw));
 }
 
 // =============================================================

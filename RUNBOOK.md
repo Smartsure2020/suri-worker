@@ -7,7 +7,7 @@ Related docs: [BOUNDARY.md](BOUNDARY.md) (banking boundary), [PRIVACY.md](PRIVAC
 
 - Cloudflare account with Workers, Queues, and Workers Rate Limiting available
 - Supabase project (note the region for PRIVACY.md §5)
-- Azure AD app registration with Graph application permissions: `Mail.Read` for the claims mailbox (admin-consented)
+- Azure AD app registration with Graph application permissions: `Mail.ReadWrite` for the `newclaims` mailbox (admin-consented; ReadWrite is needed for Outlook categories — Suri never sends email)
 - Anthropic API key
 - Cloudflare Turnstile widget (site key + secret) for the portal domain
 - Vercel project connected to the `Suri` (portal) repo
@@ -47,8 +47,12 @@ wrangler queues create suri-dead-letter-queue
 
 Ingestion worker (`wrangler secret put NAME`):
 `SUPABASE_URL`, `SUPABASE_SERVICE_KEY`, `TURNSTILE_SECRET`, `AZURE_TENANT_ID`,
-`AZURE_CLIENT_ID`, `AZURE_CLIENT_SECRET`, `SURI_MAILBOX`, `M365_WEBHOOK_SECRET`,
+`AZURE_CLIENT_ID`, `AZURE_CLIENT_SECRET`, `SURI_MAILBOX` (the `newclaims`
+mailbox), `M365_WEBHOOK_SECRET`, `ANTHROPIC_API_KEY` (Phase C1 Haiku triage),
 `ADMIN_DIAGNOSTICS_SECRET` (optional — `/admin/diagnostics` stays 404 until set).
+
+Phase C1 Azure requirement: the app registration needs **Mail.ReadWrite**
+(admin-consented) so Suri can apply Outlook categories. Suri never sends email.
 
 Processor (`wrangler secret put NAME --config wrangler.processor.toml`):
 `SUPABASE_URL`, `SUPABASE_SERVICE_KEY`, `ANTHROPIC_API_KEY`.

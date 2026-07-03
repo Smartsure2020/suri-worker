@@ -49,6 +49,12 @@ crons = ["0 */12 * * *"]
 # M365_WEBHOOK_SECRET       (random string, set in M365 subscription + here)
 # TURNSTILE_SECRET          (Cloudflare Turnstile secret key)
 # ADMIN_DIAGNOSTICS_SECRET  (random string; /admin/diagnostics is disabled/404 until set)
+# ANTHROPIC_API_KEY         (Phase C1: Haiku email triage runs in THIS worker too)
+#
+# Phase C1 notes:
+#  - SURI_MAILBOX must be the `newclaims` mailbox address.
+#  - The Azure app needs Mail.ReadWrite (was Mail.Read) so Suri can apply
+#    Outlook categories. Suri never sends email.
 
 # Routes — update to your actual domain
 
