@@ -27,23 +27,9 @@ ENVIRONMENT = "production"
 # PORTAL_API_KEY            (random string, used by Cloudflare Pages frontend)
 
 # Routes — update to your actual domain
-[[routes]]
-pattern    = "claims.novachrono.app/*"
-zone_name  = "novachrono.app"
 
 # =============================================================
-# Processor worker (separate worker, same queue as consumer)
+# Processor worker (separate worker, consumes the same queue)
+# See wrangler.processor.toml — deploy with:
+#   wrangler deploy --config wrangler.processor.toml
 # =============================================================
-
-# Add this section to your existing wrangler.toml or use a
-# second wrangler config file: wrangler.processor.toml
-
-# [[queues.consumers]]
-# queue           = "suri-processing-queue"
-# binding         = "SURI_QUEUE"
-# max_batch_size  = 5      # process up to 5 claims at once
-# max_retries     = 3      # retry failed messages 3 times
-# dead_letter_queue = "suri-dead-letter-queue"
-
-# Secrets needed by the processor (in addition to Worker secrets):
-# ANTHROPIC_API_KEY

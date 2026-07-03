@@ -25,7 +25,12 @@ import { runRulesEngine, RULES_ENGINE_VERSION } from './rules-engine.js';
 import { sanitiseAiOutput, safeLog } from './banking-scrubber.js';
 
 const CLAUDE_MODEL    = 'claude-opus-4-8';
-const PROMPT_VERSION  = 'v2.0-aol-focused';
+const PROMPT_VERSION  = 'v2.1-doc-index';
+
+// Must match max_retries in wrangler.processor.toml. When a message reaches
+// this many delivery attempts, the claim is marked 'error' so it cannot sit
+// in 'processing' forever; the message still goes to the DLQ via retry().
+const MAX_PROCESSING_ATTEMPTS = 3;
 
 // =============================================================
 // QUEUE CONSUMER ENTRY POINT
@@ -38,12 +43,38 @@ export default {
         await processMessage(message.body, env);
         message.ack();
       } catch (err) {
-        console.error(`Processing failed for message:`, JSON.stringify(message.body), err);
+        const attempts = message.attempts ?? 1;
+        console.error(`Processing failed (attempt ${attempts}) for message:`, JSON.stringify(message.body), err);
+        if (
+          message.body?.type === 'process_claim' &&
+          message.body.claim_id &&
+          attempts >= MAX_PROCESSING_ATTEMPTS
+        ) {
+          await markClaimProcessingFailed(env, message.body.claim_id, attempts, err?.message || 'unknown error');
+        }
         message.retry();
       }
     }
   },
 };
+
+// Terminal failure: mark the claim as errored and audit it, so handlers can
+// see failed claims instead of them being stuck in 'processing'. Never throws.
+// Exported for tests.
+export async function markClaimProcessingFailed(env, claimId, attempts, reason) {
+  try {
+    await updateClaim(env, claimId, { status: 'error' });
+    await auditLog(env, {
+      claim_id: claimId,
+      actor_type: 'system',
+      action: 'ai_processing_failed',
+      after_state: { attempts, terminal: true },
+      notes: `Claim processing failed after ${attempts} attempt(s) and was marked as error. Reason: ${String(reason).slice(0, 300)}`,
+    });
+  } catch (markErr) {
+    console.error(`Failed to mark claim ${claimId} as errored:`, markErr.message);
+  }
+}
 
 async function processMessage(body, env) {
   if (body.type === 'process_claim') {
@@ -87,13 +118,20 @@ async function processClaim(claimId, source, env) {
   const rulePacks        = await fetchAllRulePacks(env);
 
   // 4. Call Claude
-  const rawAiOutput = await callClaude(claim, documentPayloads, rulePacks, env);
+  const rawAiOutput = await callClaude(claim, documentPayloads, documents, rulePacks, env);
 
   // 5. DEFENSIVE GUARD — sanitise Claude output BEFORE anything else touches it
   const { sanitised, bankingDetected, redactionCount, locations } = sanitiseAiOutput(rawAiOutput);
 
   // 6. Validate sanitised output
   const validated = validateAiOutput(sanitised);
+
+  // 6b. Apply Claude's document classifications to the in-memory document
+  //     list BEFORE the rules engine and completeness checks run. Without
+  //     this, first-run claims have document_type = null on every row and
+  //     are falsely treated as missing all required documents.
+  const { documents: classifiedDocuments, assignments: documentAssignments } =
+    applyDocumentClassifications(documents, validated.document_classifications);
 
   // 7. Match rule pack
   const matchedRulePack = matchRulePack(rulePacks, validated.classification);
@@ -104,7 +142,7 @@ async function processClaim(claimId, source, env) {
       claim,
       extractedFields:  validated.extracted_fields,
       classification:   validated.classification,
-      documents,
+      documents:        classifiedDocuments,
       fraudFlags,
       rulePack:         matchedRulePack,
       aiOutput:         { confidence_score: validated.confidence_score },
@@ -113,7 +151,7 @@ async function processClaim(claimId, source, env) {
   );
 
   // 9. Document completeness (informational — already part of REQUIRED_DOCUMENTS_PRESENT rule)
-  const completenessResult = runCompletenessCheck(documents, matchedRulePack);
+  const completenessResult = runCompletenessCheck(classifiedDocuments, matchedRulePack);
 
   // 10. Assessor recommendation
   const assessorRec = determineAssessorRecommendation(
@@ -152,12 +190,12 @@ async function processClaim(claimId, source, env) {
 
   // 14. Update claim
   const claimUpdates = buildClaimUpdates(
-    validated, routing, matchedRulePack, rulesResult, bankingDetected
+    validated, routing, matchedRulePack, rulesResult, bankingDetected, claim
   );
   await updateClaim(env, claimId, { ...claimUpdates, status: 'pending_review' });
 
-  // 15. Update document types from Claude classifications
-  await updateDocumentTypes(env, documents, validated.document_classifications || []);
+  // 15. Persist document types resolved in step 6b (matched by document ID)
+  await updateDocumentTypes(env, documentAssignments);
 
   // 16. Store draft broker email (still gated by handler approval in Phase D)
   await storeBrokerEmail(env, claimId, claim, brokerEmail);
@@ -206,9 +244,9 @@ async function processClaim(claimId, source, env) {
 // CLAUDE API CALL
 // =============================================================
 
-async function callClaude(claim, documentPayloads, rulePacks, env) {
+async function callClaude(claim, documentPayloads, documents, rulePacks, env) {
   const systemPrompt = buildSystemPrompt(rulePacks);
-  const userPrompt   = buildUserPrompt(claim, documentPayloads);
+  const userPrompt   = buildUserPrompt(claim, documentPayloads, documents);
 
   const res = await fetch('https://api.anthropic.com/v1/messages', {
     method: 'POST',
@@ -231,14 +269,27 @@ async function callClaude(claim, documentPayloads, rulePacks, env) {
   }
 
   const response = await res.json();
+
+  if (response.stop_reason === 'max_tokens') {
+    throw new Error('Claude response truncated (stop_reason: max_tokens). Output discarded, not logged.');
+  }
+
   const text = response.content?.find(b => b.type === 'text')?.text;
   if (!text) throw new Error('Claude returned no text content');
 
+  return parseClaudeJson(text);
+}
+
+// BANKING BOUNDARY: model output is unsanitised until it has passed the
+// banking scrubber, so this function must never place raw model text into a
+// thrown error or log line. JSON.parse error messages quote the input on
+// modern V8, so those are withheld too. Exported for tests.
+export function parseClaudeJson(text) {
   const clean = text.replace(/```json\s*/gi, '').replace(/```\s*/g, '').trim();
   try {
     return JSON.parse(clean);
   } catch {
-    throw new Error(`Claude output not valid JSON: ${clean.slice(0, 300)}`);
+    throw new Error(`Claude output not valid JSON (${clean.length} chars). Raw output withheld from logs (banking boundary).`);
   }
 }
 
@@ -339,6 +390,7 @@ Respond with ONLY a valid JSON object — no preamble, no explanation, no markdo
   },
   "document_classifications": [
     {
+      "document_index": number,
       "original_filename": string,
       "document_type": "claim_form" | "id_document" | "policy_schedule" | "drivers_licence" | "repair_quote" | "contractors_quote" | "invoice" | "police_report" | "photos" | "bdo_authorisation" | "incident_report" | "legal_correspondence" | "sasria_form" | "other"
     }
@@ -349,6 +401,7 @@ Respond with ONLY a valid JSON object — no preamble, no explanation, no markdo
 }
 
 GUIDANCE
+- document_classifications: one entry per document. "document_index" is the 1-based position of the document in the numbered DOCUMENT LIST in the user message. Always include document_index — filenames may be duplicated.
 - claim_summary: 3–5 sentences in plain English. Who, what, when, what they are claiming for, any notable flags. No coverage opinions.
 - All monetary amounts in ZAR as numbers, no currency symbols.
 - Use "unknown"/"unclear" rather than guessing. Confidence below 0.7 should be noted in extraction_notes.
@@ -361,10 +414,16 @@ GUIDANCE
 // USER PROMPT + DOCUMENT PAYLOADS
 // =============================================================
 
-function buildUserPrompt(claim, documentPayloads) {
+function buildUserPrompt(claim, documentPayloads, documents) {
   const submissionContext = claim.incident_description
     ? `Submission form note: ${claim.incident_description}`
     : '';
+  // Numbered manifest in the same order as the attached payloads, so
+  // document_classifications can reference documents by stable index even
+  // when filenames are duplicated.
+  const manifest = (documents || [])
+    .map((d, i) => `${i + 1}. ${d.original_filename || 'unnamed'} (${d.mime_type || 'unknown type'})`)
+    .join('\n');
   return [
     {
       type: 'text',
@@ -374,7 +433,10 @@ ${submissionContext}
 Source: ${claim.source}
 Broker email: ${claim.broker_email || 'not provided'}
 
-${documentPayloads.length} document(s) attached. Read all of them carefully.`,
+DOCUMENT LIST (${documents.length} document(s), attached below in this order):
+${manifest}
+
+Read all of them carefully.`,
     },
     ...documentPayloads,
     {
@@ -384,13 +446,34 @@ ${documentPayloads.length} document(s) attached. Read all of them carefully.`,
   ];
 }
 
-async function buildDocumentPayloads(documents, env) {
+// Builds one payload per document, in the same order as `documents`, so the
+// numbered manifest in the user prompt lines up with the attachments.
+// Exported for tests.
+export async function buildDocumentPayloads(documents, env) {
   const payloads = [];
   for (const doc of documents) {
     try {
+      const mime = doc.mime_type || 'application/pdf';
+
+      // HEIC: Claude does not accept HEIC and mislabelling the raw bytes as
+      // JPEG corrupts the request. Represent it as a manual-review note.
+      if (mime === 'image/heic') {
+        payloads.push({
+          type: 'text',
+          text: `[HEIC image: ${doc.original_filename} — format not machine-readable, handler should review manually.]`,
+        });
+        continue;
+      }
+      if (mime.includes('word') || mime.includes('officedocument')) {
+        payloads.push({
+          type: 'text',
+          text: `[Word document: ${doc.original_filename} — handler should review manually.]`,
+        });
+        continue;
+      }
+
       const buffer = await downloadFromStorage(env, doc.storage_path);
       const base64 = uint8ArrayToBase64(buffer);
-      const mime   = doc.mime_type || 'application/pdf';
 
       if (mime === 'application/pdf') {
         payloads.push({
@@ -399,15 +482,14 @@ async function buildDocumentPayloads(documents, env) {
           title: doc.original_filename || 'document.pdf',
         });
       } else if (mime.startsWith('image/')) {
-        const claudeMime = mime === 'image/heic' ? 'image/jpeg' : mime;
         payloads.push({
           type: 'image',
-          source: { type: 'base64', media_type: claudeMime, data: base64 },
+          source: { type: 'base64', media_type: mime, data: base64 },
         });
-      } else if (mime.includes('word') || mime.includes('officedocument')) {
+      } else {
         payloads.push({
           type: 'text',
-          text: `[Word document: ${doc.original_filename} — handler should review manually.]`,
+          text: `[Document ${doc.original_filename} has unsupported type ${mime} — handler should review manually.]`,
         });
       }
     } catch (err) {
@@ -433,7 +515,33 @@ function matchRulePack(rulePacks, classification) {
   ) || null;
 }
 
-function runCompletenessCheck(documents, rulePack) {
+// Matches Claude's per-document classifications onto the fetched document
+// rows. Precedence: 1-based document_index (position in the numbered list
+// given to Claude) → unique filename match. Duplicate filenames without an
+// index are ambiguous and are left unclassified rather than guessed.
+// Returns copies; does not mutate the input rows. Exported for tests.
+export function applyDocumentClassifications(documents, classifications) {
+  const updated = (documents || []).map(d => ({ ...d }));
+  const assignments = [];
+  for (const cls of classifications || []) {
+    if (!cls?.document_type) continue;
+    let target = null;
+    const idx = Number(cls.document_index);
+    if (Number.isInteger(idx) && idx >= 1 && idx <= updated.length) {
+      target = updated[idx - 1];
+    } else if (cls.original_filename) {
+      const matches = updated.filter(d => d.original_filename === cls.original_filename);
+      if (matches.length === 1) target = matches[0];
+    }
+    if (target && !assignments.some(a => a.docId === target.id)) {
+      target.document_type = cls.document_type;
+      assignments.push({ docId: target.id, document_type: cls.document_type });
+    }
+  }
+  return { documents: updated, assignments };
+}
+
+export function runCompletenessCheck(documents, rulePack) {
   const present = new Set(documents.filter(d => d.document_type).map(d => d.document_type));
   if (!rulePack) {
     return { present: [...present], outstanding: [], notes: 'Rule pack not matched.', score: null };
@@ -576,48 +684,61 @@ async function storeBrokerEmail(env, claimId, claim, brokerEmail) {
   });
 }
 
-async function updateDocumentTypes(env, documents, classifications) {
-  for (const cls of classifications) {
-    const doc = documents.find(d => d.original_filename === cls.original_filename);
-    if (doc && cls.document_type) {
-      await supabasePatch(env,
-        `claim_documents?id=eq.${doc.id}`,
-        { document_type: cls.document_type, ocr_status: 'complete' }
-      );
-    }
+async function updateDocumentTypes(env, assignments) {
+  for (const a of assignments || []) {
+    await supabasePatch(env,
+      `claim_documents?id=eq.${a.docId}`,
+      { document_type: a.document_type, ocr_status: 'complete' }
+    );
   }
 }
 
-function buildClaimUpdates(validated, routing, rulePack, rulesResult, bankingDetected) {
+// Merge helper: only take the AI value when it is meaningful; otherwise keep
+// what is already on the claim (portal/email-submitted data). Preserves valid
+// zeros and empty-string-vs-null distinctions.
+function pick(aiValue, existingValue) {
+  if (aiValue === null || aiValue === undefined || aiValue === '') {
+    return existingValue ?? null;
+  }
+  return aiValue;
+}
+
+// Exported for tests (null-clobber regression).
+export function buildClaimUpdates(validated, routing, rulePack, rulesResult, bankingDetected, claim) {
   const f = validated.extracted_fields || {};
   const c = validated.classification  || {};
+  // BANKING BOUNDARY: a detection flag set at ingestion (portal/email scrub)
+  // must never be cleared by a later processing run.
+  const anyBankingDetected =
+    bankingDetected || !!f.banking_details_detected || !!claim?.banking_details_detected;
   return {
-    insured_name:           f.insured_name           || null,
-    policy_number:          f.policy_number          || null,
-    claim_type:             c.claim_type             || null,
-    peril_type:             c.peril_type             || null,
-    insurer:                c.insurer                || null,
-    incident_date:          f.incident_date          || f.date_of_loss || null,
-    incident_description:   f.incident_description   || null,
-    claimed_value:          f.claimed_value          || null,
-    excess_amount:          f.excess_amount          || null,
-    vehicle_registration:   f.vehicle_registration   || null,
-    vehicle_make_model:     f.vehicle_make_model     || null,
-    property_address:       f.property_address       || null,
-    supplier_name:          f.supplier_name          || null,
-    supplier_contact:       f.supplier_contact       || null,
-    supplier_address:       f.supplier_address       || null,
-    invoice_or_quote:       f.invoice_or_quote       || null,
-    invoice_quote_amount:   f.invoice_quote_amount   || null,
-    vat_amount:             f.vat_amount             || null,
+    insured_name:           pick(f.insured_name,           claim?.insured_name),
+    policy_number:          pick(f.policy_number,          claim?.policy_number),
+    claim_type:             pick(c.claim_type,             claim?.claim_type),
+    peril_type:             pick(c.peril_type,             claim?.peril_type),
+    insurer:                pick(c.insurer,                claim?.insurer),
+    incident_date:          pick(f.incident_date ?? f.date_of_loss, claim?.incident_date),
+    incident_description:   pick(f.incident_description,   claim?.incident_description),
+    claimed_value:          pick(f.claimed_value,          claim?.claimed_value),
+    excess_amount:          pick(f.excess_amount,          claim?.excess_amount),
+    vehicle_registration:   pick(f.vehicle_registration,   claim?.vehicle_registration),
+    vehicle_make_model:     pick(f.vehicle_make_model,     claim?.vehicle_make_model),
+    property_address:       pick(f.property_address,       claim?.property_address),
+    supplier_name:          pick(f.supplier_name,          claim?.supplier_name),
+    supplier_contact:       pick(f.supplier_contact,       claim?.supplier_contact),
+    supplier_address:       pick(f.supplier_address,       claim?.supplier_address),
+    invoice_or_quote:       pick(f.invoice_or_quote,       claim?.invoice_or_quote),
+    invoice_quote_amount:   pick(f.invoice_quote_amount,   claim?.invoice_quote_amount),
+    vat_amount:             pick(f.vat_amount,             claim?.vat_amount),
     handler_queue:          routing.handler_queue,
-    insurer_rule_id:        rulePack?.id             || null,
-    confidence_score:       validated.confidence_score || null,
+    insurer_rule_id:        pick(rulePack?.id,             claim?.insurer_rule_id),
+    confidence_score:       validated.confidence_score ?? null,
     mandate_band:           rulesResult.mandate_band,
     decision_band_reason:   rulesResult.mandate_band_reason,
-    banking_details_detected: bankingDetected || !!f.banking_details_detected,
-    banking_details_detected_notes: (bankingDetected || f.banking_details_detected)
+    banking_details_detected: anyBankingDetected,
+    banking_details_detected_notes: anyBankingDetected
       ? (f.banking_details_location_notes
+          || claim?.banking_details_detected_notes
           || 'Banking details detected in source documents and stripped by Suri. Not extracted or stored.')
       : null,
   };

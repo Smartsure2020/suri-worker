@@ -8,6 +8,8 @@
 //  - Saves full submission_payload + submission_source + submitted_role
 // =============================================================
 
+import { sanitiseAiOutput } from './banking-scrubber.js';
+
 const ALLOWED_MIME_TYPES = new Set([
   'application/pdf',
   'image/jpeg',
@@ -127,8 +129,22 @@ async function handleWebPortalUpload(request, env, ctx) {
     return corsResponse({ error: 'File validation failed', details: fileErrors }, 422, request);
   }
 
-  // 5. Create claim + upload docs + queue processing
-  const { claimId, claimRef } = await createClaimFromPortal(data, submissionPayload, files, env);
+  // 5. BANKING BOUNDARY — scrub everything the submitter typed before it is
+  //    stored or passed downstream. Forbidden keys (e.g. account_number posted
+  //    directly to this public endpoint) are dropped; banking patterns inside
+  //    free-text values are redacted. Only a detection flag is kept.
+  const payloadScrub = sanitiseAiOutput(submissionPayload);
+  const dataScrub    = sanitiseAiOutput(data);
+  const bankingScrub = {
+    bankingDetected: payloadScrub.bankingDetected || dataScrub.bankingDetected,
+    redactionCount:  payloadScrub.redactionCount + dataScrub.redactionCount,
+    locations:       [...payloadScrub.locations, ...dataScrub.locations],
+  };
+
+  // 6. Create claim + upload docs + queue processing
+  const { claimId, claimRef } = await createClaimFromPortal(
+    dataScrub.sanitised, payloadScrub.sanitised, files, env, bankingScrub
+  );
 
   ctx.waitUntil(
     env.SURI_QUEUE.send({ type: 'process_claim', claim_id: claimId, source: 'web_portal' })
@@ -179,7 +195,7 @@ async function validateTurnstile(token, request, env) {
 // CLAIM CREATION — PORTAL PATH
 // =============================================================
 
-async function createClaimFromPortal(data, submissionPayload, files, env) {
+async function createClaimFromPortal(data, submissionPayload, files, env, bankingScrub = {}) {
   const claimRef = await generateClaimRef(env, data.insurer);
 
   const submittedRole = data.submitter_role === 'client' ? 'client' : 'broker';
@@ -187,6 +203,10 @@ async function createClaimFromPortal(data, submissionPayload, files, env) {
   const claimRecord = await supabaseInsert(env, 'claims', {
     claim_ref:            claimRef,
     status:               'received',
+    banking_details_detected: bankingScrub.bankingDetected || false,
+    banking_details_detected_notes: bankingScrub.bankingDetected
+      ? 'Banking details detected in portal submission text and redacted before storage. Content not retained by Suri.'
+      : null,
     source:               'web_portal',
     submission_source:    data.submission_source,
     submitted_role:       submittedRole,
@@ -238,6 +258,21 @@ async function createClaimFromPortal(data, submissionPayload, files, env) {
     },
   });
 
+  // Location strings only (e.g. 'damage_description') — never the content.
+  if (bankingScrub.bankingDetected) {
+    await auditLog(env, {
+      claim_id:   claimId,
+      actor_type: 'system',
+      action:     'banking_details_redacted',
+      after_state: {
+        source: 'web_portal',
+        redaction_count: bankingScrub.redactionCount,
+        locations: bankingScrub.locations,
+      },
+      notes: 'Banking details detected in portal submission and redacted before storage. Content not retained by Suri.',
+    });
+  }
+
   return { claimId, claimRef };
 }
 
@@ -246,36 +281,99 @@ async function createClaimFromPortal(data, submissionPayload, files, env) {
 // =============================================================
 
 async function handleEmailWebhook(request, env, ctx) {
-  const clientState = request.headers.get('clientstate') || '';
-  if (clientState !== env.M365_WEBHOOK_SECRET) {
-    return jsonResponse({ error: 'Unauthorised' }, 401);
+  // Microsoft Graph sends the subscription validation handshake as a POST
+  // with a validationToken query parameter. It must be echoed back as
+  // text/plain within 10 seconds or the subscription cannot be created.
+  const url = new URL(request.url);
+  const validationToken = url.searchParams.get('validationToken');
+  if (validationToken) {
+    return new Response(validationToken, {
+      status: 200, headers: { 'Content-Type': 'text/plain' },
+    });
   }
-  const body = await request.json();
-  const notifications = body?.value ?? [];
-  if (!notifications.length) return jsonResponse({ status: 'no_notifications' });
-  ctx.waitUntil(Promise.allSettled(notifications.map(n => processEmailNotification(n, env))));
+
+  let body;
+  try {
+    body = await request.json();
+  } catch {
+    return jsonResponse({ error: 'Invalid JSON body' }, 400);
+  }
+
+  // Graph puts clientState inside each notification item, not in a header.
+  const { valid, rejectedCount } = filterAuthorisedNotifications(
+    body?.value, env.M365_WEBHOOK_SECRET
+  );
+  if (rejectedCount > 0) {
+    console.warn(`Rejected ${rejectedCount} Graph notification(s) with missing/invalid clientState`);
+  }
+  if (!valid.length) return jsonResponse({ status: 'no_notifications' });
+
+  ctx.waitUntil(Promise.allSettled(valid.map(n => processEmailNotification(n, env))));
   return jsonResponse({ status: 'accepted' }, 202);
 }
 
-async function processEmailNotification(notification, env) {
+// Exported for tests. Fails closed: if the secret is not configured,
+// every notification is rejected.
+export function filterAuthorisedNotifications(notifications, secret) {
+  const list = Array.isArray(notifications) ? notifications : [];
+  if (!secret) return { valid: [], rejectedCount: list.length };
+  const valid = list.filter(n => n?.clientState === secret);
+  return { valid, rejectedCount: list.length - valid.length };
+}
+
+// Exported for tests (message-id dedupe).
+export async function processEmailNotification(notification, env) {
   const messageId = notification?.resourceData?.id;
   if (!messageId) return;
   const existing = await supabaseQuery(env, 'inbound_emails', 'select', { message_id: `eq.${messageId}` });
-  if (existing?.length > 0) return;
+  if (existing?.length > 0) {
+    console.log(`Skipping already-ingested message ${messageId}`);
+    return;
+  }
   const email = await fetchGraphEmail(messageId, env);
-  if (!email || !isLikelyClaimEmail(email)) return;
+  if (!email) {
+    await auditLog(env, {
+      actor_type: 'system', action: 'email_fetch_failed',
+      after_state: { message_id: messageId },
+      notes: 'Graph email fetch failed — message not ingested. Check mailbox and Graph credentials.',
+    });
+    return;
+  }
+  if (!isLikelyClaimEmail(email)) {
+    // Audit skipped emails so non-matching claim emails do not silently vanish.
+    await auditLog(env, {
+      actor_type: 'system', action: 'email_skipped_not_claim',
+      after_state: {
+        message_id: messageId,
+        from: email.from?.emailAddress?.address || '',
+        subject: email.subject || '',
+      },
+      notes: 'Inbound email did not match claim keywords and was not ingested. Review the mailbox if this was a genuine claim.',
+    });
+    return;
+  }
   const attachments = await fetchGraphAttachments(messageId, env);
   const { claimId } = await createClaimFromEmail(email, attachments, env);
   await env.SURI_QUEUE.send({ type: 'process_claim', claim_id: claimId, source: 'email' });
 }
 
 async function createClaimFromEmail(email, attachments, env) {
+  // BANKING BOUNDARY — broker emails routinely quote supplier banking details
+  // in the body. Redact before storage; keep only a detection flag. The
+  // original email remains in the source mailbox for the payment workflow.
+  const emailScrub = sanitiseAiOutput({
+    subject:   email.subject || '',
+    body_text: email.body?.contentType === 'text' ? email.body.content : null,
+    body_html: email.body?.contentType === 'html' ? email.body.content : null,
+  });
+  const safeEmail = emailScrub.sanitised;
+
   const inboundEmailRecord = await supabaseInsert(env, 'inbound_emails', {
     from_address: email.from?.emailAddress?.address || '',
     to_address:   email.toRecipients?.[0]?.emailAddress?.address || '',
-    subject:      email.subject || '',
-    body_text:    email.body?.contentType === 'text' ? email.body.content : null,
-    body_html:    email.body?.contentType === 'html'  ? email.body.content : null,
+    subject:      safeEmail.subject,
+    body_text:    safeEmail.body_text,
+    body_html:    safeEmail.body_html,
     message_id:   email.id,
     thread_id:    email.conversationId || null,
     source:       'outlook',
@@ -293,14 +391,30 @@ async function createClaimFromEmail(email, attachments, env) {
     submitted_at:      new Date().toISOString(),
     broker_email:      email.from?.emailAddress?.address || null,
     broker_name:       email.from?.emailAddress?.name || null,
+    banking_details_detected: emailScrub.bankingDetected || false,
+    banking_details_detected_notes: emailScrub.bankingDetected
+      ? 'Banking details detected in inbound email body and redacted before storage. Content not retained by Suri.'
+      : null,
   });
   const claimId = claimRecord.id;
   await supabaseUpdate(env, 'inbound_emails', inboundEmailId, { claim_id: claimId });
   await uploadAttachments(attachments, claimId, inboundEmailId, env);
   await auditLog(env, {
     claim_id: claimId, actor_type: 'system', action: 'claim_received',
-    after_state: { source: 'email', from: email.from?.emailAddress?.address, subject: email.subject },
+    after_state: { source: 'email', from: email.from?.emailAddress?.address, subject: safeEmail.subject },
   });
+  // Location strings only (e.g. 'body_html') — never the content.
+  if (emailScrub.bankingDetected) {
+    await auditLog(env, {
+      claim_id: claimId, actor_type: 'system', action: 'banking_details_redacted',
+      after_state: {
+        source: 'email',
+        redaction_count: emailScrub.redactionCount,
+        locations: emailScrub.locations,
+      },
+      notes: 'Banking details detected in inbound email and redacted before storage. Content not retained by Suri.',
+    });
+  }
   return { claimId, inboundEmailId };
 }
 
@@ -449,9 +563,14 @@ async function generateClaimRef(env, insurer) {
   return res.json();
 }
 
-async function auditLog(env, { claim_id, actor_id = null, actor_type, action, before_state = null, after_state = null, notes = null }) {
+async function auditLog(env, { claim_id = null, actor_id = null, actor_type, action, before_state = null, after_state = null, notes = null }) {
+  // BANKING BOUNDARY: scrub state objects before insert (email subjects and
+  // free text can carry banking details).
+  const safeBefore = before_state ? sanitiseAiOutput(before_state).sanitised : null;
+  const safeAfter  = after_state  ? sanitiseAiOutput(after_state).sanitised  : null;
   await supabaseInsert(env, 'audit_log', {
-    claim_id, actor_id, actor_type, action, before_state, after_state, notes,
+    claim_id, actor_id, actor_type, action,
+    before_state: safeBefore, after_state: safeAfter, notes,
   }).catch(err => console.error('Audit insert failed:', err));
 }
 

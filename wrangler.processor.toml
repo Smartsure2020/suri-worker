@@ -1,0 +1,29 @@
+# =============================================================
+# Suri — queue processor Worker config
+# Deploy with:  wrangler deploy --config wrangler.processor.toml
+#
+# Secrets (set with: wrangler secret put NAME --config wrangler.processor.toml)
+#   SUPABASE_URL
+#   SUPABASE_SERVICE_KEY
+#   ANTHROPIC_API_KEY
+#
+# Queues (create once):
+#   wrangler queues create suri-processing-queue
+#   wrangler queues create suri-dead-letter-queue
+# =============================================================
+
+name       = "suri-processor"
+main       = "suri-processor.js"
+compatibility_date = "2025-04-01"
+
+[vars]
+ENVIRONMENT = "production"
+
+# max_retries must match MAX_PROCESSING_ATTEMPTS in suri-processor.js:
+# on the final attempt the claim is marked status='error' with an audit
+# entry, and the message then lands in the dead-letter queue for ops review.
+[[queues.consumers]]
+queue             = "suri-processing-queue"
+max_batch_size    = 5
+max_retries       = 3
+dead_letter_queue = "suri-dead-letter-queue"

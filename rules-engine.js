@@ -24,7 +24,10 @@
 //   }
 // =============================================================
 
-const RULES_ENGINE_VERSION = 'v1.0';
+// v1.1: safest-amount mandate check (max of claimed/invoice, zero/negative
+// never pass), non-critical unknowns treated as warnings, honest band
+// reasons, fail-safe when no rules were applicable/evaluated.
+const RULES_ENGINE_VERSION = 'v1.1';
 
 // =============================================================
 // MAIN ENTRY
@@ -89,7 +92,7 @@ export async function runRulesEngine(context, env) {
   const ruleResults = {};
   const criticalUnknowns = [];
   let hasCriticalFailOrUnknown = false;
-  let hasNonCriticalFail = false;
+  let hasNonCriticalWarn = false;
 
   for (const rule of applicableRules) {
     const evaluator = EVALUATORS[rule.evaluator_key];
@@ -119,34 +122,56 @@ export async function runRulesEngine(context, env) {
       description: rule.description,
     };
 
-    // Band assignment tally
+    // Band assignment tally.
+    // Non-critical 'unknown' counts as a warning too — an unevaluable check
+    // must never silently count as a pass.
     if (result.result === 'fail' || result.result === 'unknown') {
       if (rule.is_critical) {
         hasCriticalFailOrUnknown = true;
         if (result.result === 'unknown') criticalUnknowns.push(rule.rule_code);
-      } else if (rule.fail_action === 'warn' && result.result === 'fail') {
-        hasNonCriticalFail = true;
+      } else {
+        hasNonCriticalWarn = true;
       }
     }
   }
 
-  // 7. Deterministic band assignment
+  // 6b. Fail safe: if no rules were applicable at all, nothing was actually
+  // checked — that must not read as "all rules passed".
+  if (Object.keys(ruleResults).length === 0) {
+    return failSafeBand1(
+      'no_applicable_rules',
+      'No active mandate rules were applicable to this claim. Nothing was checked — defaulting to Band 1 for safety.'
+    );
+  }
+
+  // 7. Deterministic band assignment with honest reasons
+  const describe = ([code, r]) => `${code} (${r.result})`;
   let band, reason;
   if (hasCriticalFailOrUnknown) {
     band = 'band_1';
-    const failedCodes = Object.entries(ruleResults)
+    const failed = Object.entries(ruleResults)
       .filter(([_, r]) => r.is_critical && (r.result === 'fail' || r.result === 'unknown'))
-      .map(([code]) => code);
-    reason = `Critical rule(s) did not pass: ${failedCodes.join(', ')}. Routed to admin review.`;
-  } else if (hasNonCriticalFail) {
+      .map(describe);
+    reason = `Critical rule(s) did not pass: ${failed.join(', ')}. Routed to admin review.`;
+  } else if (hasNonCriticalWarn) {
     band = 'band_2';
-    const warnCodes = Object.entries(ruleResults)
-      .filter(([_, r]) => !r.is_critical && r.result === 'fail')
-      .map(([code]) => code);
-    reason = `Claim appears valid but ${warnCodes.join(', ')} need(s) handler attention. Recommended: approve AOL subject to handler confirmation of cover, excess and policy status.`;
+    const warns = Object.entries(ruleResults)
+      .filter(([_, r]) => !r.is_critical && (r.result === 'fail' || r.result === 'unknown'))
+      .map(describe);
+    reason = `All critical rules passed, but non-critical check(s) need handler attention: ${warns.join(', ')}. Handler to confirm cover, excess and policy status before any decision.`;
   } else {
+    const counts = Object.values(ruleResults).reduce(
+      (acc, r) => { acc[r.result] = (acc[r.result] || 0) + 1; return acc; }, {}
+    );
+    if (!counts.pass) {
+      return failSafeBand1(
+        'no_rules_evaluated',
+        'Every applicable rule was not-applicable to this claim — nothing was actually checked. Defaulting to Band 1 for safety.'
+      );
+    }
     band = 'band_3';
-    reason = 'All rules passed. Claim eligible for pre-mandate authorisation recommendation. Handler to confirm and approve.';
+    const naNote = counts.not_applicable ? ` (${counts.not_applicable} not applicable)` : '';
+    reason = `All ${counts.pass} applicable rule(s) passed${naNote}. Claim eligible for pre-mandate authorisation recommendation. Handler to confirm and approve.`;
   }
 
   return {
@@ -181,26 +206,64 @@ function failSafeBand1(code, reason) {
 // result is 'pass' | 'fail' | 'unknown' | 'not_applicable'
 // =============================================================
 
-const EVALUATORS = {
+// Accepts numbers and clean numeric strings (PostgREST can serialise
+// decimals either way). Anything else is treated as not-a-value.
+function normaliseAmount(value) {
+  if (typeof value === 'number' && Number.isFinite(value)) return value;
+  if (typeof value === 'string' && /^-?\d+(\.\d+)?$/.test(value.trim())) {
+    return parseFloat(value.trim());
+  }
+  return null;
+}
+
+// Exported for tests.
+export const EVALUATORS = {
+  // Evaluates the SAFEST amount: the maximum of all known amounts across the
+  // AI extraction and the submitted claim record. Zero and negative amounts
+  // never pass; conflicting figures are surfaced in the reason.
   amount_within_mandate(ctx, rule, opts) {
-    const value = ctx.extractedFields?.claimed_value;
-    if (value === null || value === undefined) {
-      return { result: 'unknown', reason: 'Claimed value not extracted from documents.' };
+    const sources = {
+      extracted_claimed:  normaliseAmount(ctx.extractedFields?.claimed_value),
+      extracted_invoice:  normaliseAmount(ctx.extractedFields?.invoice_quote_amount),
+      submitted_claimed:  normaliseAmount(ctx.claim?.claimed_value),
+      submitted_invoice:  normaliseAmount(ctx.claim?.invoice_quote_amount),
+    };
+    const known = Object.entries(sources).filter(([, v]) => v !== null);
+
+    if (known.length === 0) {
+      return { result: 'unknown', reason: 'No claimed or invoice/quote amount could be established from the submission or documents.' };
     }
-    if (typeof value !== 'number' || isNaN(value)) {
-      return { result: 'unknown', reason: 'Claimed value is not a valid number.' };
-    }
-    if (value > opts.mandateLimit) {
+    const negatives = known.filter(([, v]) => v < 0);
+    if (negatives.length > 0) {
       return {
         result: 'fail',
-        reason: `Claimed value R${value.toLocaleString()} exceeds pre-mandate limit R${opts.mandateLimit.toLocaleString()}.`,
-        details: { claimed_value: value, limit: opts.mandateLimit },
+        reason: `Negative amount detected (${negatives.map(([k, v]) => `${k}: R${v.toLocaleString()}`).join(', ')}). Amounts cannot be negative — data error, handler review required.`,
+        details: { sources },
+      };
+    }
+    const effective = Math.max(...known.map(([, v]) => v));
+    if (effective === 0) {
+      return {
+        result: 'unknown',
+        reason: 'All known claimed/invoice amounts are zero — claim value could not be established.',
+        details: { sources },
+      };
+    }
+    const distinct = [...new Set(known.map(([, v]) => v).filter(v => v > 0))];
+    const conflictNote = distinct.length > 1
+      ? ` Using highest of conflicting amounts (${distinct.map(v => `R${v.toLocaleString()}`).join(', ')}).`
+      : '';
+    if (effective > opts.mandateLimit) {
+      return {
+        result: 'fail',
+        reason: `Highest known amount R${effective.toLocaleString()} exceeds pre-mandate limit R${opts.mandateLimit.toLocaleString()}.${conflictNote}`,
+        details: { effective_amount: effective, limit: opts.mandateLimit, sources },
       };
     }
     return {
       result: 'pass',
-      reason: `Claimed value R${value.toLocaleString()} within pre-mandate limit R${opts.mandateLimit.toLocaleString()}.`,
-      details: { claimed_value: value, limit: opts.mandateLimit },
+      reason: `Highest known amount R${effective.toLocaleString()} within pre-mandate limit R${opts.mandateLimit.toLocaleString()}.${conflictNote}`,
+      details: { effective_amount: effective, limit: opts.mandateLimit, sources },
     };
   },
 

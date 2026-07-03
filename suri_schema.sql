@@ -205,19 +205,22 @@ create table claim_documents (
   inbound_email_id  uuid references inbound_emails(id),
   document_type     text,
   -- claim_form | id_document | policy_schedule | drivers_licence |
-  -- repair_quote | police_report | photos | bank_statement | other
+  -- repair_quote | police_report | photos | other
   storage_path      text not null,    -- Supabase Storage path
   original_filename text,
   mime_type         text,
   file_size_bytes   bigint,
-  extracted_text    text,             -- Claude's extracted text content
+  -- BANKING BOUNDARY: no raw extracted document text is ever stored here.
+  -- Documents may contain banking details; Suri stores only the source file
+  -- and a detection flag on the claim. Any future text-storage column must
+  -- pass banking-scrubber.js before insert.
   ocr_status        document_ocr_status not null default 'pending',
   is_required       boolean,          -- derived from insurer_rule_pack
   uploaded_at       timestamptz not null default now()
 );
 
 comment on table claim_documents is
-  'Individual attachments. extracted_text is populated by Claude during processing.';
+  'Individual attachments stored in Supabase Storage. Raw document text is never stored (banking boundary).';
 
 -- =============================================================
 -- CLAIM AI OUTPUTS
@@ -510,9 +513,9 @@ create policy "handlers_update_fraud_flags" on fraud_flags
 insert into insurer_rule_packs (insurer, claim_type, required_documents, optional_documents, assessor_threshold, loss_adjuster_threshold, mandate_cap_notes) values
 
 -- Infiniti motor
-('infiniti', 'motor', 
+('infiniti', 'motor',
   '["claim_form","id_document","policy_schedule","drivers_licence","repair_quote"]',
-  '["police_report","photos","bank_statement"]',
+  '["police_report","photos"]',
   15000.00, 75000.00,
   'Infiniti mandate: R75k motor, R50k non-motor. Confirm with UW for specialist.'),
 
